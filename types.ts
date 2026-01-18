@@ -139,7 +139,7 @@ export interface GameEvent {
     id: string;
     title: string;
     description: string;
-    effect: (state: GameState, currentPlayerIdx: number) => Partial<GameState>;
+    effect: (state: GameState, currentPlayerIdx: number) => GameState;
     tags?: string[]; // 'economy', 'risk', etc.
 }
 
@@ -210,6 +210,7 @@ export interface GameState {
   // Economy Event Modifiers (Advanced)
   rentEventMul?: number; // Multiplicador Global
   rentEventTurns?: number;
+  creditCrunchTurns?: number; // v23: Turns where new loans are blocked
   
   buildEventMul?: number; // Coste construcción
   buildEventTurns?: number;

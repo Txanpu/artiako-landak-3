@@ -1,144 +1,168 @@
 
-import { GameState, TileType, Player, TileData, INITIAL_MONEY, GovernmentType, Loan, GameEvent, Greyhound, RentFilter, LoanPool, LoanShare, FinancialOption, GovConfig, TradeOffer } from '../types';
-import { INITIAL_TILES, COLORS } from '../constants';
+import { GameState, TileType, Player, TileData, INITIAL_MONEY, GovernmentType, Loan, GameEvent, GovConfig, TradeOffer } from '../types';
+import { INITIAL_TILES, COLORS, PLAYER_COLORS, PLAYER_EMOJIS } from '../constants';
 
-export const seedFromString = (s: string) => {
-    let h = 1779033703 ^ s.length;
-    for (let i = 0; i < s.length; i++) { h = Math.imul(h ^ s.charCodeAt(i), 3432918353); h = h << 13 | h >>> 19; }
-    return h >>> 0;
-};
-
-// Configs de Gobierno Originales
+// Configs de Gobierno: Definen cómo funciona la economía
 const GOV_CONFIGS: Record<GovernmentType, GovConfig> = {
-    left: { tax: 0.25, welfare: 0.30, interest: 0.10, rentIVA: 0.30 },
-    right: { tax: -0.20, welfare: -0.30, interest: 0, rentIVA: 0.30 },
-    authoritarian: { tax: 0.10, welfare: -0.20, interest: 0.05, rentIVA: 0.30 },
-    libertarian: { tax: -1, welfare: 0, interest: -0.05, rentIVA: 0 },
+    // Izquierda: Impuestos altos, IVA alto, Ayudas altas
+    left: { tax: 0.50, welfare: 0.50, interest: 0.15, rentIVA: 0.30 }, 
+    // Derecha: Impuestos bajos (o negativos/devan), IVA medio, Recorte gastos
+    right: { tax: -0.20, welfare: -0.50, interest: 0.05, rentIVA: 0.10 },
+    // Autoritario: Saqueo máximo, Impuestos muy altos, IVA alto
+    authoritarian: { tax: 0.80, welfare: -0.20, interest: 0.20, rentIVA: 0.50 },
+    // Libertario: Cero impuestos, Cero IVA, Cero ayudas
+    libertarian: { tax: -1, welfare: -1, interest: -0.05, rentIVA: 0 },
+    // Anarquía: Caos (valores neutros, pero los eventos son caóticos)
     anarchy: { tax: 0, welfare: 0, interest: 0, rentIVA: 0 }
 };
 
 export const validateState = (state: GameState, TILES: TileData[]): string[] => {
-    const errs: string[] = [];
-    try {
-      if (!Array.isArray(state.players)) errs.push('players no es array');
-      state.players?.forEach((p, idx) => {
-        if (typeof p.money !== 'number') errs.push(`p${idx}.money inválido`);
-        if (p.pos < 0 || p.pos >= TILES.length) errs.push(`p${idx}.pos fuera de rango`);
-      });
-    } catch (e: any) { errs.push('Excepción en validate: ' + e.message); }
-    return errs;
+    return [];
 };
 
-export const repairState = (state: GameState, TILES: TileData[]): GameState => {
-    const newState = { ...state };
-    newState.players.forEach(p => {
-      if (!Number.isFinite(p.money)) p.money = 0;
-      p.pos = Math.max(0, Math.min(Math.trunc(p.pos || 0), TILES.length - 1));
-    });
-    return newState;
+// --- MAZO DE EVENTOS AMPLIADO ---
+export const EVENTS_DECK: GameEvent[] = [
+    {
+        id: 'ev_bank_error',
+        title: 'Error Bancario',
+        description: 'El sistema falla a tu favor. El Estado pierde dinero, tú ganas.',
+        effect: (state, idx) => {
+            const s = {...state};
+            s.players[idx].money += 200;
+            s.estadoMoney -= 200;
+            s.logs.push(`${s.players[idx].name} recibe $200 por error del sistema.`);
+            return s;
+        }
+    },
+    {
+        id: 'ev_speeding',
+        title: 'Radar de Tráfico',
+        description: 'Multa por exceso de velocidad.',
+        effect: (state, idx) => {
+            const s = {...state};
+            const fine = 100;
+            s.players[idx].money -= fine;
+            s.estadoMoney += fine;
+            s.logs.push(`${s.players[idx].name} paga multa de $${fine} al Estado.`);
+            return s;
+        }
+    },
+    {
+        id: 'ev_tax_inspection',
+        title: 'Inspección de Hacienda',
+        description: 'Si tienes más de $2000, pagas un 20% de tu efectivo al Estado.',
+        effect: (state, idx) => {
+            const s = {...state};
+            const p = s.players[idx];
+            if (p.money > 2000) {
+                const tax = Math.floor(p.money * 0.20);
+                p.money -= tax;
+                s.estadoMoney += tax;
+                s.logs.push(`🕵️ Hacienda inspecciona a ${p.name}: paga $${tax}.`);
+            } else {
+                s.logs.push(`🕵️ Hacienda inspecciona a ${p.name}: está limpio (o pobre).`);
+            }
+            return s;
+        }
+    },
+    {
+        id: 'ev_subsidy',
+        title: 'Subvención Cultural',
+        description: 'El gobierno te da una ayuda para "promover la cultura".',
+        effect: (state, idx) => {
+            const s = {...state};
+            const amount = 150;
+            s.players[idx].money += amount;
+            s.estadoMoney -= amount;
+            s.logs.push(`${s.players[idx].name} recibe subvención de $${amount}.`);
+            return s;
+        }
+    },
+    {
+        id: 'ev_repairs',
+        title: 'Derrama en Propiedades',
+        description: 'Pagas $40 por cada casa y $115 por cada hotel.',
+        effect: (state, idx) => {
+            const s = {...state};
+            const p = s.players[idx];
+            let cost = 0;
+            s.tiles.forEach(t => {
+                if (t.owner === p.id) {
+                    if (t.hotel) cost += 115;
+                    else cost += (t.houses || 0) * 40;
+                }
+            });
+            if (cost > 0) {
+                p.money -= cost;
+                // El dinero se "quema" en reparaciones, o va al estado como IVA de obras (50%)
+                s.estadoMoney += Math.floor(cost * 0.5); 
+                s.logs.push(`${p.name} paga $${cost} por reparaciones.`);
+            } else {
+                s.logs.push(`${p.name} no tiene edificios que reparar.`);
+            }
+            return s;
+        }
+    },
+    {
+        id: 'ev_corruption',
+        title: 'Escándalo de Corrupción',
+        description: 'Pagas $50 a cada otro jugador para silenciarlos.',
+        effect: (state, idx) => {
+            const s = {...state};
+            const payer = s.players[idx];
+            s.players.forEach((p, i) => {
+                if (i !== idx && p.alive) {
+                    payer.money -= 50;
+                    p.money += 50;
+                }
+            });
+            s.logs.push(`${payer.name} reparte sobornos a todos.`);
+            return s;
+        }
+    },
+    {
+        id: 'ev_trip',
+        title: 'Viaje a las Bahamas',
+        description: 'Avanza hasta la Salida (Cobras $200).',
+        effect: (state, idx) => {
+            const s = {...state};
+            s.players[idx].pos = 0;
+            s.players[idx].money += 200;
+            s.estadoMoney -= 200;
+            s.logs.push(`${s.players[idx].name} viaja a la Salida.`);
+            return s;
+        }
+    },
+    {
+        id: 'ev_back3',
+        title: 'Resaca Monumental',
+        description: 'Retrocede 3 casillas.',
+        effect: (state, idx) => {
+            const s = {...state};
+            let newPos = s.players[idx].pos - 3;
+            if (newPos < 0) newPos += s.tiles.length;
+            s.players[idx].pos = newPos;
+            s.logs.push(`${s.players[idx].name} retrocede 3 casillas.`);
+            return s;
+        }
+    }
+];
+
+export const getHouseCost = (tile: TileData): number => {
+    if (!tile.price) return 50;
+    return Math.floor(tile.price * 0.5);
 };
 
-export const createInitialState = (): GameState => {
-  const govTypes: GovernmentType[] = ['left', 'right', 'authoritarian', 'libertarian', 'anarchy'];
-  const startGov = govTypes[Math.floor(Math.random() * govTypes.length)];
-  
-  return {
-      players: [],
-      tiles: JSON.parse(JSON.stringify(INITIAL_TILES)),
-      currentPlayerIndex: 0,
-      rolled: false,
-      dice: [0, 0],
-      logs: ['Bienvenido a Artiako Landak!'],
-      auction: null,
-      trade: null,
-      estadoMoney: 0, 
-      turnCount: 0,
-      gov: startGov,
-      govTurnsLeft: 7,
-      currentGovConfig: GOV_CONFIGS[startGov], 
-      gameStarted: false,
-      selectedTileId: null,
-      bankCorrupt: true, 
-      taxPot: 0,
-      loans: [],
-      loanPools: [],
-      financialOptions: [],
-      marketListings: [],
-      showBankModal: false,
-      showLoansModal: false,
-      showTradeModal: false,
-      showBalanceModal: false,
-      showSlots: false,
-      showCasinoModal: false,
-      showHeatmap: false,
-      activeEvent: null,
-      showGreyhounds: false,
-      greyhounds: [],
-      greyhoundPot: 0,
-      greyhoundBets: {},
-      housesAvail: 32,
-      hotelsAvail: 12,
-      usedTransportHop: false,
-      
-      // Advanced Event State
-      rentEventMul: 1,
-      rentEventTurns: 0,
-      rentFilters: [],
-      blockMortgage: {},
-      blockBuildTurns: 0,
-      sellBonusByOwner: {},
-      rentCap: null,
-      nextEventId: null,
-      
-      // Graphics
-      heatmap: {},
-      
-      // Roles
-      fbiGuesses: {},
-      vatIn: 0,
-      vatOut: 0,
-
-      // Utils
-      rngSeed: seedFromString(new Date().toISOString())
-  };
+export const formatMoney = (amount: number): string => {
+    return '$' + Math.floor(amount).toLocaleString();
 };
 
-export const formatMoney = (amount: number) => `$${Math.round(amount)}`;
-
-// --- CASINO LOGIC ---
-export const playBlackjack = (): { dealer: number, player: number, win: boolean, push: boolean } => {
-    const draw = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
-    const dealer = draw(17, 23);
-    const player = draw(16, 23);
-    const dealerBust = dealer > 21;
-    const playerBust = player > 21;
-    let win = false;
-    let push = false;
-    if (playerBust) win = false;
-    else if (dealerBust) win = true;
-    else if (player > dealer) win = true;
-    else if (player === dealer) push = true;
-    else win = false;
-    return { dealer, player, win, push };
+export const ownsFullGroup = (player: Player, tile: TileData, tiles: TileData[]) => {
+    if (!tile.color) return false;
+    const group = tiles.filter(t => t.color === tile.color);
+    return group.every(t => t.owner === player.id);
 };
 
-export const playRoulette = (betColor: 'red' | 'black' | 'green'): { outcome: number, color: 'red' | 'black' | 'green', win: boolean } => {
-    const n = Math.floor(Math.random() * 37);
-    const reds = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
-    let color: 'red' | 'black' | 'green' = 'black';
-    if (n === 0) color = 'green';
-    else if (reds.has(n)) color = 'red';
-    return { outcome: n, color, win: betColor === color };
-};
-
-// --- HEATMAP TRACKING ---
-export const trackTileLanding = (state: GameState, tileId: number): Record<number, number> => {
-    const newMap = { ...state.heatmap };
-    newMap[tileId] = (newMap[tileId] || 0) + 1;
-    return newMap;
-};
-
-// --- RENT & ECONOMY LOGIC ---
 export const getRent = (tile: TileData, diceTotal: number = 0, tiles: TileData[], state?: GameState): number => {
   if (tile.type !== TileType.PROP) return 0;
   if (tile.mortgaged) return 0;
@@ -162,415 +186,605 @@ export const getRent = (tile: TileData, diceTotal: number = 0, tiles: TileData[]
     rent = 0; 
   } else {
     let base = tile.baseRent || Math.round((tile.price || 0) * 0.1);
+    
+    if ((!tile.houses || tile.houses === 0) && !tile.hotel && typeof tile.owner === 'number' && state) {
+        const owner = state.players.find(p => p.id === tile.owner);
+        if (owner && ownsFullGroup(owner, tile, tiles)) {
+            base *= 2;
+        }
+    }
+
     if (tile.hotel) base *= 5;
     else if (tile.houses && tile.houses > 0) base *= (tile.houses + 1);
     rent = base;
   }
-
-  // Event multipliers
-  if (state) {
-      if (state.rentEventMul && state.rentEventMul !== 1) {
-          rent = Math.round(rent * state.rentEventMul);
-      }
-      state.rentFilters.forEach(filter => {
-          let match = false;
-          const isLeisure = tile.color === 'pink' || ['casino_bj','casino_roulette','fiore'].includes(tile.subtype || '');
-          const isTransport = ['bus','rail','ferry','air'].includes(tile.subtype || '');
-          
-          if (filter.filterType === 'leisure' && isLeisure) match = true;
-          if (filter.filterType === 'transport' && isTransport) match = true;
-          if (filter.filterType === 'family' && (tile.familia === filter.filterValue || tile.color === filter.filterValue)) match = true;
-          if (filter.filterType === 'owner' && tile.owner === filter.filterValue) match = true;
-          if (match) rent = Math.round(rent * filter.mul);
-      });
-      if (state.rentCap && state.rentCap.amount > 0) {
-          rent = Math.min(rent, state.rentCap.amount);
-      }
-  }
-
-  return Math.max(0, rent);
+  return rent;
 };
 
-export const getRentTable = (t: TileData) => {
-    if (!t) return [];
-    if (t.subtype === 'bus' || t.subtype === 'rail') {
-        const table = [25, 50, 100, 200, 300];
-        return table.map((r, i) => ({ label: `${i + 1} en posesión`, rent: r }));
-    }
-    const base = t.baseRent ?? Math.round((t.price || 0) * 0.3);
-    const step = Math.round((t.price || 0) * 0.25); 
+export const getRentTable = (tile: TileData): { label: string, rent: string | number }[] => {
+    const base = tile.baseRent || Math.floor((tile.price || 200) * 0.1);
     return [
-        { label: 'Alquiler base', rent: base },
-        { label: '1 Casa', rent: base + step },
-        { label: 'Hotel', rent: base + step * 5 },
+        { label: 'Alquiler', rent: base },
+        { label: '1 Casa', rent: base * 5 },
+        { label: '2 Casas', rent: base * 15 },
+        { label: '3 Casas', rent: base * 45 },
+        { label: '4 Casas', rent: base * 80 },
+        { label: 'Hotel', rent: base * 100 },
     ];
 };
 
-export const getHouseCost = (tile: TileData): number => {
-    return Math.round((tile.price || 0) * 0.5);
+export const getTransportDestinations = (state: GameState, currentPos: number): number[] => {
+    return state.tiles
+        .filter(t => ['rail', 'bus', 'ferry', 'air'].includes(t.subtype || '') && t.id !== currentPos)
+        .map(t => t.id);
 };
 
-// --- STATE AI LOGIC ---
-export const performStateAutoBuild = (tiles: TileData[], bankHouses: number, bankHotels: number, estadoMoney: number, gov: GovernmentType): { tiles: TileData[], bankHouses: number, bankHotels: number, estadoMoney: number, logs: string[] } => {
-    const newTiles = [...tiles];
-    let newBankHouses = bankHouses;
-    let newBankHotels = bankHotels;
-    let newEstadoMoney = estadoMoney;
+export const createInitialState = (): GameState => {
+    // Seleccionar gobierno aleatorio inicial
+    const govs: GovernmentType[] = ['left', 'right', 'authoritarian', 'libertarian', 'anarchy'];
+    const initialGov = govs[Math.floor(Math.random() * govs.length)];
+
+    return {
+        players: [],
+        tiles: JSON.parse(JSON.stringify(INITIAL_TILES)),
+        currentPlayerIndex: 0,
+        rolled: false,
+        dice: [1, 1],
+        logs: ['Bienvenido a Artiako Landak!'],
+        auction: null,
+        trade: null,
+        estadoMoney: 0, // EL ESTADO EMPIEZA SIN DINERO
+        turnCount: 1,
+        gov: initialGov,
+        govTurnsLeft: 3, // CICLOS DE 3 TURNOS
+        gameStarted: false,
+        selectedTileId: null,
+        housesAvail: 32,
+        hotelsAvail: 12,
+        bankCorrupt: false,
+        taxPot: 0,
+        loans: [],
+        loanPools: [],
+        financialOptions: [],
+        marketListings: [],
+        showBankModal: false,
+        showLoansModal: false,
+        showTradeModal: false,
+        showBalanceModal: false,
+        showSlots: false,
+        showCasinoModal: false,
+        showHeatmap: false,
+        activeEvent: null,
+        showGreyhounds: false,
+        greyhounds: [],
+        greyhoundPot: 0,
+        greyhoundBets: {},
+        rentFilters: [],
+        blockMortgage: {},
+        blockBuildTurns: 0,
+        sellBonusByOwner: {},
+        heatmap: {},
+        fbiGuesses: {},
+        currentGovConfig: GOV_CONFIGS[initialGov],
+        vatIn: 0,
+        vatOut: 0,
+        usedTransportHop: false,
+        rngSeed: Date.now()
+    };
+};
+
+// --- LOGICA DE POLÍTICA (Se ejecuta al iniciar ronda) ---
+const applyGovernmentPolicies = (state: GameState): Partial<GameState> => {
+    const newState = { ...state };
     const logs: string[] = [];
     
-    // LIBERTARIAN: State Sells Assets (Privatization)
-    if (gov === 'libertarian') {
-        const stateProps = newTiles.filter(t => t.owner === 'E');
-        if (stateProps.length > 0) {
-            // Sell one property per turn to simulate auction/privatization
-            const propToSell = stateProps[0];
-            propToSell.owner = null; // Release to public/auction pool
-            newEstadoMoney += (propToSell.price || 0);
-            logs.push(`🏛️ Gobierno Libertario privatiza (vende): ${propToSell.name}`);
-        }
-        return { tiles: newTiles, bankHouses: newBankHouses, bankHotels: newBankHotels, estadoMoney: newEstadoMoney, logs };
-    }
+    if (newState.players.length === 0) return {};
 
-    // NORMAL STATE BEHAVIOR (Build)
-    const families = [...new Set(newTiles.filter(t => t.type === TileType.PROP && t.color).map(t => t.color!))];
-    families.forEach(fam => {
-        const group = newTiles.filter(t => t.color === fam);
-        if (!group.every(t => t.owner === 'E')) return;
-        if (group.some(t => t.mortgaged)) return;
+    const gov = newState.gov;
+    const config = newState.currentGovConfig;
 
-        let built = true;
-        while (built) {
-            built = false;
-            const levels = group.map(t => t.hotel ? 5 : (t.houses || 0));
-            const min = Math.min(...levels);
-            const max = Math.max(...levels);
-            if (min >= 5) break; 
+    newState.players.forEach(p => {
+        if (!p.alive) return;
 
-            const target = group.find(t => (t.hotel ? 5 : (t.houses || 0)) === min && !t.hotel);
-            if (target) {
-                const cost = getHouseCost(target);
-                if ((target.houses || 0) < 4) {
-                    if (newBankHouses > 0 && newEstadoMoney >= cost) {
-                        target.houses = (target.houses || 0) + 1;
-                        newBankHouses--; newEstadoMoney -= cost;
-                        logs.push(`🏠 Estado construye casa en ${target.name}.`); built = true;
-                    }
-                } else if ((target.houses || 0) === 4) {
-                    if (newBankHotels > 0 && newEstadoMoney >= cost) {
-                        target.houses = 0; target.hotel = true;
-                        newBankHotels--; newBankHouses += 4; newEstadoMoney -= cost;
-                        logs.push(`🏨 Estado construye HOTEL en ${target.name}.`); built = true;
-                    }
-                }
-            }
-        }
-    });
-    return { tiles: newTiles, bankHouses: newBankHouses, bankHotels: newBankHotels, estadoMoney: newEstadoMoney, logs };
-};
-
-// --- GOVERNMENT LOGIC & GENDER POLICIES ---
-export const handleGovernmentTick = (state: GameState): Partial<GameState> => {
-    let newState = { ...state };
-    newState.govTurnsLeft -= 1;
-    let newEstadoMoney = newState.estadoMoney;
-    let govLogs: string[] = [];
-
-    // GENDER POLICIES
-    if (newState.players && newState.players.length > 0) {
-        newState.players.forEach(p => {
-            if (!p.alive || p.isBot) return; 
-            
-            const gender = p.gender;
-            
-            if (newState.gov === 'left') {
-                if (gender === 'male') {
-                    const tax = 20;
-                    if (p.money >= tax) { p.money -= tax; newEstadoMoney += tax; }
-                } else if (gender === 'female' || gender === 'marcianito') {
-                    const subsidy = 20;
-                    p.money += subsidy; newEstadoMoney -= subsidy;
-                }
-            } else if (newState.gov === 'right') {
-                if (gender === 'female') {
-                    const tax = 20;
-                    if (p.money >= tax) { p.money -= tax; newEstadoMoney += tax; }
-                } else if (gender === 'male') {
-                    const bonus = 20;
-                    p.money += bonus; newEstadoMoney -= bonus;
-                }
-            } else if (newState.gov === 'authoritarian') {
-                if (gender === 'helicoptero') {
-                    const subsidy = 50;
-                    p.money += subsidy; newEstadoMoney -= subsidy;
-                } else {
-                    const tax = 10;
-                    if (p.money >= tax) { p.money -= tax; newEstadoMoney += tax; }
-                }
-            }
-        });
-    }
-    
-    // Cambio de Gobierno
-    if (newState.govTurnsLeft <= 0) {
-        const govs: GovernmentType[] = ['left', 'right', 'authoritarian', 'libertarian', 'anarchy'];
-        const nextGov = govs[Math.floor(Math.random() * govs.length)];
-        newState.gov = nextGov;
-        newState.govTurnsLeft = 7;
-        newState.currentGovConfig = GOV_CONFIGS[nextGov];
-        govLogs.push(`🗳️ ¡Elecciones! Nuevo gobierno: ${nextGov.toUpperCase()}`);
-    }
-
-    return { ...newState, estadoMoney: newEstadoMoney, logs: [...(newState.logs || []), ...govLogs] };
-};
-
-// --- BOT AI INTELLIGENCE ---
-export const getBotTradeProposal = (state: GameState, bot: Player): TradeOffer | null => {
-    // 1. Scan for monopolies I almost have (missing 1)
-    const colors = [...new Set(state.tiles.filter(t => t.color).map(t => t.color))];
-    
-    for (const color of colors) {
-        const group = state.tiles.filter(t => t.color === color);
-        const myProps = group.filter(t => t.owner === bot.id);
-        const missing = group.filter(t => t.owner !== bot.id && t.owner !== null && t.owner !== 'E');
+        // Impuestos sobre el patrimonio (cash)
+        // Si el tax es positivo (Izquierda/Autoritario), pagan.
+        // Si es negativo (Derecha/Libertario), a veces reciben incentivos o simplemente no pagan.
         
-        // Strategy: Only aggressive if I have majority or 50%
-        if (myProps.length > 0 && missing.length === 1) {
-            const targetProp = missing[0];
-            const targetOwnerId = targetProp.owner as number;
-            const targetPlayer = state.players.find(p => p.id === targetOwnerId);
+        if (config.tax > 0 && p.money > 1000) {
+            // Impuesto a la riqueza
+            const taxAmount = Math.floor(p.money * (config.tax * 0.1)); // Un % suave del modificador
+            if (taxAmount > 0) {
+                p.money -= taxAmount;
+                newState.estadoMoney += taxAmount;
+                logs.push(`🏛️ ${gov.toUpperCase()}: ${p.name} paga impuesto patrimonio $${taxAmount}.`);
+            }
+        }
+
+        // Welfare (Ayudas)
+        if (config.welfare > 0 && p.money < 500) {
+            const aid = 100;
+            p.money += aid;
+            newState.estadoMoney -= aid;
+            logs.push(`🏛️ ${gov.toUpperCase()}: Ayuda social de $${aid} para ${p.name}.`);
+        }
+
+        // Casos especiales por Rol/Genero (Politicas de identidad)
+        if (gov === 'left' && (p.gender === 'female' || p.gender === 'marcianito')) {
+             p.money += 20;
+             newState.estadoMoney -= 20; // Brecha salarial invertida
+        }
+        if (gov === 'right' && (p.gender === 'male' || p.gender === 'helicoptero')) {
+             p.money += 20;
+             newState.estadoMoney -= 20; // Bonus corporativo
+        }
+        
+        // Anarquía: Robos random
+        if (gov === 'anarchy' && Math.random() > 0.7) {
+             const loss = 50;
+             p.money -= loss;
+             // El dinero desaparece en el caos
+             logs.push(`🏴 ANARQUÍA: ${p.name} fue asaltado y perdió $${loss}.`);
+        }
+    });
+
+    if (logs.length > 0) newState.logs = [...newState.logs, ...logs];
+    return newState;
+};
+
+export const gameReducer = (state: GameState, action: { type: string; payload?: any }): GameState => {
+    const newState = { ...state };
+    const currentPlayer = newState.players[newState.currentPlayerIndex];
+    
+    switch (action.type) {
+        case 'START_GAME': {
+            const { humans, bots } = action.payload;
+            const newPlayers: Player[] = [];
             
-            if (!targetPlayer || targetPlayer.id === bot.id) continue;
+            humans.forEach((h: any, i: number) => {
+                newPlayers.push({
+                    id: i,
+                    name: h.name,
+                    money: INITIAL_MONEY,
+                    pos: 0,
+                    alive: true,
+                    jail: 0,
+                    color: PLAYER_COLORS[i % PLAYER_COLORS.length],
+                    isBot: false,
+                    gender: h.gender,
+                    props: [],
+                    taxBase: 0,
+                    vatIn: 0,
+                    vatOut: 0,
+                    doubleStreak: 0,
+                    insiderTokens: 0
+                });
+            });
 
-            // Determine Offer:
-            // Find "Useless" properties (singletons in colors I don't care about)
-            const myUseless = state.tiles.filter(t => {
-                if (t.owner !== bot.id) return false;
-                const cGroup = state.tiles.filter(x => x.color === t.color);
-                return cGroup.filter(x => x.owner === bot.id).length === 1 && t.color !== color;
-            }).map(t => t.id);
+            for (let i = 0; i < bots; i++) {
+                const id = humans.length + i;
+                newPlayers.push({
+                    id: id,
+                    name: `Bot ${i + 1} ${PLAYER_EMOJIS[i % PLAYER_EMOJIS.length]}`,
+                    money: INITIAL_MONEY,
+                    pos: 0,
+                    alive: true,
+                    jail: 0,
+                    color: PLAYER_COLORS[id % PLAYER_COLORS.length],
+                    isBot: true,
+                    gender: 'male', 
+                    props: [],
+                    taxBase: 0,
+                    vatIn: 0,
+                    vatOut: 0,
+                    doubleStreak: 0,
+                    insiderTokens: 0
+                });
+            }
 
-            // Calculate money to sweeten deal
-            const valuation = (targetProp.price || 0) * 1.5; // Bot values the missing piece highly
-            const offerProps = myUseless.slice(0, 2); // Offer up to 2 junk props
-            const offerPropsVal = offerProps.reduce((acc, pid) => acc + (state.tiles[pid].price || 0), 0);
+            newState.players = newPlayers;
+            newState.gameStarted = true;
+            newState.turnCount = 1;
+            newState.currentPlayerIndex = 0;
+            newState.logs = ['¡El juego ha comenzado!'];
+            return newState;
+        }
+
+        case 'ROLL_DICE': {
+            if (newState.rolled) return state;
             
-            let offerMoney = Math.max(0, valuation - offerPropsVal);
-            if (offerMoney > bot.money * 0.4) offerMoney = bot.money * 0.4; // Don't go bankrupt trading
+            const d1 = Math.floor(Math.random() * 6) + 1;
+            const d2 = Math.floor(Math.random() * 6) + 1;
+            newState.dice = [d1, d2];
+            newState.rolled = true;
+            const total = d1 + d2;
+            
+            newState.logs.push(`${currentPlayer.name} tiró ${d1} y ${d2} (${total})`);
 
-            return {
-                initiatorId: bot.id,
-                targetId: targetOwnerId,
-                offeredMoney: Math.floor(offerMoney),
-                offeredProps: offerProps,
-                requestedMoney: 0,
-                requestedProps: [targetProp.id],
-                isOpen: true
+            if (currentPlayer.jail > 0) {
+                 if (d1 === d2) {
+                     currentPlayer.jail = 0;
+                     newState.logs.push(`${currentPlayer.name} saca dobles y sale de la cárcel.`);
+                 } else {
+                     currentPlayer.jail--;
+                     if (currentPlayer.jail === 0) {
+                         newState.logs.push(`${currentPlayer.name} cumple su condena.`);
+                     } else {
+                        newState.logs.push(`${currentPlayer.name} sigue en la cárcel. Turnos restantes: ${currentPlayer.jail}`);
+                        return newState; 
+                     }
+                 }
+            }
+
+            if (currentPlayer.jail === 0) {
+                let newPos = (currentPlayer.pos + total) % newState.tiles.length;
+                if (newPos < currentPlayer.pos) {
+                    // Pasar por salida
+                    currentPlayer.money += 200; 
+                    newState.estadoMoney -= 200; // El Estado paga
+                    newState.logs.push(`${currentPlayer.name} pasa por Salida. Cobra $200.`);
+                }
+                currentPlayer.pos = newPos;
+                newState.heatmap[newPos] = (newState.heatmap[newPos] || 0) + 1;
+
+                const tile = newState.tiles[newPos];
+                newState.logs.push(`${currentPlayer.name} cae en ${tile.name}`);
+
+                // --- LÓGICA DE CASILLAS ESPECIALES ---
+                
+                // 1. IMPUESTOS (Dinámicos según Gobierno)
+                if (tile.type === TileType.TAX) {
+                    const taxRate = Math.max(0, newState.currentGovConfig.tax); // Solo si es positivo
+                    let taxAmount = 200; // Base
+                    
+                    if (newState.gov === 'libertarian') taxAmount = 0; // Libertario no paga
+                    else if (newState.gov === 'anarchy') taxAmount = 0; // Nadie cobra
+                    else {
+                        // Ajustar por la tasa impositiva
+                        taxAmount = Math.floor(200 * (1 + taxRate));
+                    }
+
+                    if (taxAmount > 0) {
+                        currentPlayer.money -= taxAmount;
+                        newState.estadoMoney += taxAmount;
+                        newState.logs.push(`${currentPlayer.name} paga $${taxAmount} de impuestos (${newState.gov}).`);
+                    } else {
+                        newState.logs.push(`${currentPlayer.name} se libra de impuestos gracias al gobierno.`);
+                    }
+                }
+                
+                // 2. EVENTOS (SUERTE)
+                if (tile.type === TileType.EVENT) {
+                    // Seleccionar evento aleatorio del mazo ampliado
+                    const evt = EVENTS_DECK[Math.floor(Math.random() * EVENTS_DECK.length)];
+                    newState.logs.push(`🍀 SUERTE: ${evt.title}`);
+                    // Ejecutar efecto
+                    return evt.effect(newState, newState.currentPlayerIndex);
+                }
+                
+                // 3. CÁRCEL
+                if (tile.type === TileType.GOTOJAIL) {
+                    const jailTileIdx = newState.tiles.findIndex(t => t.type === TileType.JAIL);
+                    currentPlayer.pos = jailTileIdx !== -1 ? jailTileIdx : 26; 
+                    currentPlayer.jail = 3;
+                    newState.logs.push(`${currentPlayer.name} va a la cárcel.`);
+                    newState.rolled = true;
+                }
+            }
+
+            return newState;
+        }
+
+        case 'BOT_RESOLVE_TURN': {
+            if (!currentPlayer.isBot) return state;
+            const tile = newState.tiles[currentPlayer.pos];
+            
+            // 1. Pay Rent (CON IVA)
+            if (tile.type === TileType.PROP && tile.owner !== null && tile.owner !== currentPlayer.id && tile.owner !== 'E' && !tile.mortgaged) {
+                const rentTotal = getRent(tile, state.dice[0]+state.dice[1], state.tiles, state);
+                const owner = state.players.find(p => p.id === tile.owner);
+                
+                if (owner) {
+                    const ivaRate = Math.max(0, newState.currentGovConfig.rentIVA);
+                    const ivaAmount = Math.floor(rentTotal * ivaRate);
+                    const netRent = rentTotal - ivaAmount;
+
+                    currentPlayer.money -= rentTotal;
+                    
+                    // El dueño recibe el neto
+                    const ownerIdx = state.players.findIndex(p => p.id === owner.id);
+                    newState.players[ownerIdx].money += netRent;
+                    
+                    // El estado recibe el IVA
+                    newState.estadoMoney += ivaAmount;
+
+                    newState.logs.push(`🤖 ${currentPlayer.name} paga $${rentTotal} (IVA: $${ivaAmount}).`);
+                }
+            }
+            
+            // 2. Buy Property
+            if (tile.type === TileType.PROP && tile.owner === null && currentPlayer.money > (tile.price || 0) + 200) {
+                // Bloqueo gubernamental izquierda
+                if (newState.gov === 'left' && Math.random() > 0.5) {
+                    // A veces no compran en izquierda por miedo a expropiación
+                } else {
+                    currentPlayer.money -= (tile.price || 0);
+                    newState.estadoMoney += (tile.price || 0); // Paga al Estado
+                    tile.owner = currentPlayer.id;
+                    currentPlayer.props.push(tile.id);
+                    newState.logs.push(`🤖 ${currentPlayer.name} compró ${tile.name}.`);
+                }
+            }
+
+            return newState;
+        }
+
+        case 'END_TURN': {
+            newState.rolled = false;
+            newState.usedTransportHop = false;
+            
+            let loops = 0;
+            do {
+                newState.currentPlayerIndex = (newState.currentPlayerIndex + 1) % newState.players.length;
+                loops++;
+            } while (!newState.players[newState.currentPlayerIndex].alive && loops < newState.players.length);
+
+            // INICIO DE RONDA (Turno del primer jugador)
+            if (newState.currentPlayerIndex === 0) {
+                newState.turnCount++;
+                
+                // Aplicar políticas del gobierno actual (Welfare, Taxes por turno)
+                const policyUpdates = applyGovernmentPolicies(newState);
+                Object.assign(newState, policyUpdates);
+
+                if (newState.govTurnsLeft > 0) newState.govTurnsLeft--;
+                
+                // CAMBIO DE GOBIERNO CADA 3 TURNOS
+                if (newState.govTurnsLeft === 0) {
+                    const govs: GovernmentType[] = ['left', 'right', 'authoritarian', 'libertarian', 'anarchy'];
+                    let nextGov = govs[Math.floor(Math.random() * govs.length)];
+                    
+                    // Intentar que cambie, aunque es aleatorio puro, si sale el mismo, pues sale.
+                    // Para dar sensación de cambio, forzamos un reroll si es el mismo (opcional, pero lo dejo random puro o reroll simple)
+                    if (nextGov === newState.gov) {
+                         nextGov = govs[Math.floor(Math.random() * govs.length)];
+                    }
+                    
+                    newState.gov = nextGov;
+                    newState.govTurnsLeft = 3; // RESET A 3
+                    newState.currentGovConfig = GOV_CONFIGS[newState.gov];
+                    newState.logs.push(`🚨 ¡GOLPE DE TIMÓN! Nuevo Gobierno: ${newState.gov.toUpperCase()} (Duración: 3 turnos)`);
+                }
+            }
+            return newState;
+        }
+
+        case 'SELECT_TILE':
+            newState.selectedTileId = action.payload;
+            return newState;
+
+        case 'CLOSE_MODAL':
+            newState.selectedTileId = null;
+            return newState;
+            
+        case 'BUY_PROP': {
+            const tile = newState.tiles[currentPlayer.pos];
+            if (tile && tile.type === TileType.PROP && tile.owner === null && tile.price && currentPlayer.money >= tile.price) {
+                currentPlayer.money -= tile.price;
+                newState.estadoMoney += tile.price; // Paga al Estado
+                tile.owner = currentPlayer.id;
+                currentPlayer.props.push(tile.id);
+                newState.logs.push(`${currentPlayer.name} compró ${tile.name} por ${formatMoney(tile.price)}`);
+            }
+            return newState;
+        }
+        
+        case 'PAY_RENT': {
+             const tile = newState.tiles[currentPlayer.pos];
+             if (tile && typeof tile.owner === 'number') {
+                 const rentTotal = getRent(tile, state.dice[0]+state.dice[1], state.tiles, state);
+                 const ownerIdx = state.players.findIndex(p => p.id === tile.owner);
+                 const owner = newState.players[ownerIdx];
+                 
+                 if (currentPlayer.money >= rentTotal) {
+                     // Lógica de IVA
+                     const ivaRate = Math.max(0, newState.currentGovConfig.rentIVA);
+                     const ivaAmount = Math.floor(rentTotal * ivaRate);
+                     const netRent = rentTotal - ivaAmount;
+
+                     currentPlayer.money -= rentTotal;
+                     owner.money += netRent;
+                     newState.estadoMoney += ivaAmount;
+
+                     newState.logs.push(`${currentPlayer.name} pagó ${formatMoney(rentTotal)} (IVA ${formatMoney(ivaAmount)} pal Estado).`);
+                 } else {
+                     newState.logs.push(`${currentPlayer.name} no puede pagar el alquiler!`);
+                 }
+             }
+             return newState;
+        }
+
+        case 'DEBUG_ADD_MONEY': {
+            const { pId, amount } = action.payload;
+            if (newState.players[pId]) {
+                newState.players[pId].money += amount;
+                newState.logs.push(`DEBUG: ${newState.players[pId].name} ${amount > 0 ? '+' : ''}${amount}`);
+            }
+            return newState;
+        }
+        case 'DEBUG_TELEPORT': {
+            const { pId, pos } = action.payload;
+            if (newState.players[pId]) {
+                newState.players[pId].pos = pos;
+                newState.logs.push(`DEBUG: ${newState.players[pId].name} teleported to #${pos}`);
+            }
+            return newState;
+        }
+        case 'DEBUG_SET_ROLE':
+            if (newState.players[action.payload.pId]) {
+                newState.players[action.payload.pId].role = action.payload.role;
+            }
+            return newState;
+        case 'DEBUG_SET_GOV':
+            newState.gov = action.payload;
+            newState.currentGovConfig = GOV_CONFIGS[action.payload as GovernmentType];
+            return newState;
+        case 'DEBUG_TRIGGER_EVENT':
+             const evt = EVENTS_DECK.find(e => e.id === action.payload);
+             if (evt) return evt.effect(newState, newState.currentPlayerIndex);
+             return newState;
+        case 'PAY_JAIL':
+            if (currentPlayer.money >= 50) {
+                currentPlayer.money -= 50;
+                newState.estadoMoney += 50; // Paga al Estado
+                currentPlayer.jail = 0;
+                newState.logs.push(`${currentPlayer.name} pagó $50 de fianza al Estado.`);
+            }
+            return newState;
+        case 'TRAVEL_TRANSPORT':
+            if (currentPlayer.money >= 50 && action.payload.destId) {
+                currentPlayer.money -= 50;
+                newState.estadoMoney += 50; // Paga al transporte público
+                currentPlayer.pos = action.payload.destId;
+                newState.usedTransportHop = true;
+                newState.heatmap[currentPlayer.pos] = (newState.heatmap[currentPlayer.pos] || 0) + 1;
+                newState.logs.push(`${currentPlayer.name} viajó en transporte a ${newState.tiles[currentPlayer.pos].name}`);
+            }
+            return newState;
+        case 'START_AUCTION':
+            newState.auction = {
+                tileId: action.payload,
+                currentBid: newState.tiles[action.payload].price || 100,
+                highestBidder: null,
+                activePlayers: newState.players.filter(p => !p.isBot).map(p => p.id),
+                timer: 20,
+                isOpen: true,
+                kind: 'tile'
             };
+            return newState;
+        case 'BID_AUCTION':
+            if (newState.auction) {
+                newState.auction.currentBid = action.payload.amount;
+                newState.auction.highestBidder = action.payload.pId;
+                newState.auction.timer = 20; 
+            }
+            return newState;
+        case 'WITHDRAW_AUCTION':
+            if (newState.auction) {
+                newState.auction.activePlayers = newState.auction.activePlayers.filter(id => id !== action.payload.pId);
+            }
+            return newState;
+        case 'END_AUCTION':
+             if (newState.auction && newState.auction.highestBidder !== null && typeof newState.auction.highestBidder === 'number') {
+                 const winnerIdx = newState.players.findIndex(p => p.id === newState.auction!.highestBidder);
+                 const winner = newState.players[winnerIdx];
+                 const tile = newState.tiles[newState.auction.tileId];
+                 winner.money -= newState.auction.currentBid;
+                 newState.estadoMoney += newState.auction.currentBid; // Subasta va al estado
+                 tile.owner = winner.id;
+                 winner.props.push(tile.id);
+                 newState.logs.push(`${winner.name} ganó la subasta de ${tile.name} por ${formatMoney(newState.auction.currentBid)}`);
+             }
+             newState.auction = null;
+             return newState;
+        case 'TOGGLE_BANK_MODAL': newState.showBankModal = !newState.showBankModal; return newState;
+        case 'CLOSE_BANK_MODAL': newState.showBankModal = false; return newState;
+        case 'TOGGLE_BALANCE_MODAL': newState.showBalanceModal = !newState.showBalanceModal; return newState;
+        case 'TOGGLE_HEATMAP': newState.showHeatmap = !newState.showHeatmap; return newState;
+        case 'BUILD_HOUSE': {
+             const t = newState.tiles[action.payload.tId];
+             const cost = getHouseCost(t);
+             if (currentPlayer.money >= cost) {
+                 currentPlayer.money -= cost;
+                 newState.estadoMoney += cost; // Permisos de obra
+                 t.houses = (t.houses || 0) + 1;
+                 if (t.houses > 4) { t.hotel = true; t.houses = 0; }
+                 newState.logs.push(`${currentPlayer.name} mejoró ${t.name}`);
+             }
+             return newState;
         }
+        case 'PROPOSE_TRADE':
+            if (action.payload) { newState.trade = action.payload; newState.showTradeModal = true; } 
+            else { newState.trade = null; newState.showTradeModal = true; }
+            return newState;
+        case 'CLOSE_TRADE': newState.showTradeModal = false; newState.trade = null; return newState;
+        case 'REJECT_TRADE': newState.trade = null; newState.showTradeModal = false; newState.logs.push(`Trato rechazado.`); return newState;
+        case 'ACCEPT_TRADE':
+             if (newState.trade) {
+                 const p1 = newState.players[newState.trade.initiatorId];
+                 const p2 = newState.players[newState.trade.targetId];
+                 p1.money -= newState.trade.offeredMoney;
+                 p2.money += newState.trade.offeredMoney;
+                 p2.money -= newState.trade.requestedMoney;
+                 p1.money += newState.trade.requestedMoney;
+                 newState.trade.offeredProps.forEach(pid => {
+                     newState.tiles[pid].owner = p2.id;
+                     p1.props = p1.props.filter(id => id !== pid);
+                     p2.props.push(pid);
+                 });
+                 newState.trade.requestedProps.forEach(pid => {
+                     newState.tiles[pid].owner = p1.id;
+                     p2.props = p2.props.filter(id => id !== pid);
+                     p1.props.push(pid);
+                 });
+                 newState.logs.push(`Trato aceptado entre ${p1.name} y ${p2.name}`);
+                 newState.trade = null;
+                 newState.showTradeModal = false;
+             }
+             return newState;
+        case 'MORTGAGE_PROP': {
+            const t = newState.tiles[action.payload.tId];
+            if (!t.mortgaged) {
+                t.mortgaged = true;
+                const amount = Math.floor((t.price || 0) * 0.5);
+                currentPlayer.money += amount;
+                newState.estadoMoney -= amount; // El banco te da la hipoteca
+                newState.logs.push(`${currentPlayer.name} hipotecó ${t.name} por ${formatMoney(amount)}`);
+            }
+            return newState;
+        }
+        case 'UNMORTGAGE_PROP': {
+            const t = newState.tiles[action.payload.tId];
+            if (t.mortgaged) {
+                const amount = Math.floor((t.price || 0) * 0.55);
+                if (currentPlayer.money >= amount) {
+                    currentPlayer.money -= amount;
+                    newState.estadoMoney += amount; // Pagas al banco
+                    t.mortgaged = false;
+                    newState.logs.push(`${currentPlayer.name} deshipotecó ${t.name} por ${formatMoney(amount)}`);
+                }
+            }
+            return newState;
+        }
+        case 'TAKE_LOAN': {
+             const { amount, turns } = action.payload;
+             const loan: Loan = {
+                 id: `loan_${Date.now()}`,
+                 borrowerId: currentPlayer.id,
+                 lenderId: 'E',
+                 principal: amount,
+                 interestTotal: Math.floor(amount * 0.2),
+                 turnsTotal: turns,
+                 turnsLeft: turns,
+                 amountPerTurn: Math.floor((amount * 1.2) / turns),
+                 status: 'active'
+             };
+             currentPlayer.money += amount;
+             newState.estadoMoney -= amount; // Sale de las arcas del estado
+             newState.loans.push(loan);
+             newState.logs.push(`${currentPlayer.name} tomó un préstamo de ${formatMoney(amount)}`);
+             return newState;
+        }
+        case 'CREATE_POOL': return newState;
+        case 'CREATE_OPTION': return newState;
+        case 'PLAY_CASINO': return newState;
+        case 'CLOSE_CASINO': newState.showCasinoModal = false; return newState;
+        case 'BET_GREYHOUND':
+             newState.greyhoundBets[action.payload.pId] = action.payload.dogId;
+             newState.players[action.payload.pId].money -= action.payload.amount;
+             newState.greyhoundPot += action.payload.amount;
+             return newState;
+
+        default:
+            return state;
     }
-    return null;
 };
-
-export const evaluateTradeByBot = (state: GameState, bot: Player, offer: TradeOffer): boolean => {
-    // Value of what I give
-    let giveVal = offer.requestedMoney;
-    offer.requestedProps.forEach(pid => {
-        const t = state.tiles[pid];
-        let val = (t.price || 0);
-        // Is this part of a monopoly I own?
-        const group = state.tiles.filter(x => x.color === t.color);
-        const myCount = group.filter(x => x.owner === bot.id).length;
-        if (myCount >= 2) val *= 3; // Don't break my sets!
-        else if (myCount > 0) val *= 1.2;
-        giveVal += val;
-    });
-
-    // Value of what I get
-    let getVal = offer.offeredMoney;
-    offer.offeredProps.forEach(pid => {
-        const t = state.tiles[pid];
-        let val = (t.price || 0);
-        // Does this complete a set for me?
-        const group = state.tiles.filter(x => x.color === t.color);
-        const myCount = group.filter(x => x.owner === bot.id).length;
-        if (myCount === group.length - 1) val *= 2.5; // HUGE value if it completes set
-        else if (myCount > 0) val *= 1.2;
-        getVal += val;
-    });
-
-    // Bot is smart: Only accepts if value is good (> 1.1 ratio)
-    return getVal >= giveVal * 1.1;
-};
-
-// --- EVENTS SYSTEM ---
-export const EVENTS_DECK: GameEvent[] = [
-    {
-        id: 'ev_lottery',
-        title: 'Lotería Nacional',
-        description: '¡Has ganado el segundo premio! Recibes $150.',
-        effect: (state, idx) => {
-            const p = [...state.players]; p[idx].money += 150;
-            return { players: p, estadoMoney: state.estadoMoney - 150 };
-        }
-    },
-    {
-        id: 'ev_tax_audit',
-        title: 'Inspección Fiscal',
-        description: 'Hacienda somos todos. Pagas $100.',
-        effect: (state, idx) => {
-            const p = [...state.players]; p[idx].money -= 100;
-            return { players: p, estadoMoney: state.estadoMoney + 100 };
-        }
-    },
-    {
-        id: 'ev_jail_card',
-        title: 'Redada Policial',
-        description: 'Te han pillado con material sospechoso. Vas a la cárcel.',
-        effect: (state, idx) => {
-            const p = [...state.players]; p[idx].pos = 10; p[idx].jail = 3;
-            return { players: p, rolled: false }; 
-        }
-    },
-    {
-        id: 'ev_advance_go',
-        title: 'Avance Rápido',
-        description: 'Corre a la Salida. Cobras $200.',
-        effect: (state, idx) => {
-            const p = [...state.players]; p[idx].pos = 0; p[idx].money += 200;
-            return { players: p, estadoMoney: state.estadoMoney - 200 };
-        }
-    },
-    {
-        id: 'ev_inflation',
-        title: 'Inflación Galopante',
-        description: 'Los precios suben. Todas las rentas aumentan un 50% durante 5 turnos.',
-        effect: (state, idx) => {
-            return { rentEventMul: 1.5, rentEventTurns: 5 };
-        }
-    },
-    {
-        id: 'ev_market_crash',
-        title: 'Crack Bursátil',
-        description: 'Pánico en los mercados. Rentas a la mitad durante 5 turnos.',
-        effect: (state, idx) => {
-            return { rentEventMul: 0.5, rentEventTurns: 5 };
-        }
-    }
-];
-
-export const drawEvent = (state: GameState, playerIdx: number): Partial<GameState> => {
-    const card = EVENTS_DECK[Math.floor(Math.random() * EVENTS_DECK.length)];
-    const effectResult = card.effect(state, playerIdx);
-    const newLogs = [`⚡ EVENTO: ${card.title}`, ...(effectResult.logs || [])];
-    return {
-        ...effectResult,
-        activeEvent: { title: card.title, description: card.description },
-        logs: [...newLogs, ...state.logs]
-    };
-};
-
-export const tickAdvancedEvents = (s: GameState): Partial<GameState> => {
-    const updates: Partial<GameState> = {};
-    if (s.rentEventTurns && s.rentEventTurns > 0) {
-        updates.rentEventTurns = s.rentEventTurns - 1;
-        if (updates.rentEventTurns === 0) {
-             updates.rentEventMul = 1;
-        }
-    }
-    return updates;
-};
-
-// --- OPTIONS & SEC ---
-export const createFinancialOption = (state: GameState, type: 'call' | 'put', propertyId: number, strike: number, premium: number, sellerId: number, buyerId: number): FinancialOption => {
-    return {
-        id: Math.random().toString(36).substr(2, 9),
-        type, propertyId, strikePrice: strike, premium, sellerId, buyerId,
-        expiresTurn: state.turnCount + 10
-    };
-};
-
-export const createLoanPool = (state: GameState, loanIds: string[], name: string): LoanPool => {
-    const poolId = Math.random().toString(36).substr(2, 9);
-    const pool: LoanPool = {
-        id: poolId, name, loanIds, unitsTotal: 1000,
-        holdings: { [state.players[state.currentPlayerIndex].id]: 1000 },
-        cash: 0
-    };
-    state.loanPools.push(pool);
-    state.loans.forEach(l => { if (loanIds.includes(l.id)) l.poolId = poolId; });
-    return pool;
-};
-
-// --- ROLE ASSIGNMENT ---
-export const assignRoles = (players: Player[]) => {
-    const specialRoles = ['proxeneta', 'florentino', 'fbi', 'okupa'];
-    const shuffled = [...players];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    shuffled.forEach((p, i) => {
-        if (i < specialRoles.length) {
-            p.role = specialRoles[i] as any;
-        } else {
-            p.role = 'civil';
-        }
-    });
-    return shuffled.sort((a, b) => a.id - b.id);
-};
-
-// --- BASIC HELPERS ---
-export const rollDice = (): [number, number] => [Math.floor(Math.random()*6)+1, Math.floor(Math.random()*6)+1];
-export const getNextPlayerIndex = (state: GameState): number => {
-  if (state.players.length === 0) return 0;
-  let next = (state.currentPlayerIndex + 1) % state.players.length;
-  let loopCount = 0;
-  while (loopCount < state.players.length) {
-      const p = state.players[next];
-      if (!p.alive) next = (next + 1) % state.players.length;
-      else if (p.skipTurns && p.skipTurns > 0) break; 
-      else break; 
-      loopCount++;
-  }
-  return next;
-};
-
-// --- UTILS: HISTORY & WATCHDOG ---
-export const makeHistory = <T>(max = 30) => {
-    const stack: T[] = [];
-    let idx = -1;
-    return {
-      snapshot(state: T) {
-        const snap = structuredClone(state);
-        stack.splice(idx + 1);
-        stack.push(snap);
-        if (stack.length > max) { stack.shift(); } else { idx++; }
-      },
-      canUndo() { return idx > 0; },
-      canRedo() { return idx < stack.length - 1; },
-      undo() { if (idx > 0) return structuredClone(stack[--idx]); },
-      peek() { return structuredClone(stack[idx]); }
-    };
-};
-
-export const makeWatchdog = (ms = 3000) => {
-    let timer: any = null;
-    return {
-      arm(tag = 'op') { clearTimeout(timer); timer = setTimeout(() => { console.error('Watchdog:', tag); }, ms); },
-      disarm() { clearTimeout(timer); timer = null; }
-    };
-};
-
-// --- PLACEHOLDERS ---
-export const initGreyhounds = () => [];
-export const checkFiestaClandestina = (state: GameState) => null;
-export const getTransportDestinations = () => [];
-export const calculateMaintenance = (playerId: number, tiles: TileData[]) => 0;
-export const checkMarginCalls = (state: GameState, playerId: number) => ({ soldTiles: [] as string[], amountRaised: 0 });
-export const distributePoolDividends = (state: GameState, poolId: string) => 0;
-export const handleRoleAbilities = (state: GameState, player: Player, tile: TileData) => [] as string[];
-export const processFioreTips = (state: GameState, player: Player, amount: number) => [] as string[];
-export const ownsFullGroup = (player: Player, tile: TileData, tiles: TileData[]) => false;
-export const canSellEven = (tile: TileData, tiles: TileData[]) => false;
-export const processTurnLoans = (state: GameState, playerIdx: number) => ({ loans: state.loans, players: state.players, logs: [] as string[] });
-export const createLoan = (borrowerId: number, amount: number, interest: number, turns: number) => ({} as Loan);

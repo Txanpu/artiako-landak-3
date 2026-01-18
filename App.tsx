@@ -1,841 +1,176 @@
 
-import React, { useState, useEffect, useReducer, useRef } from 'react';
+import React, { useReducer, useState, useEffect, useCallback } from 'react';
+import { GameState, TileType, TradeOffer } from './types';
+import { createInitialState, gameReducer, getHouseCost, formatMoney, getRentTable, getTransportDestinations } from './utils/gameLogic';
 import { Board } from './components/Board';
 import { DebugPanel } from './components/DebugPanel';
-import { GameState, Player, TileType, INITIAL_MONEY, TileData, Loan, AuctionState, TradeOffer, FinancialOption } from './types';
-import { createInitialState, rollDice, getRent, formatMoney, getNextPlayerIndex, assignRoles, handleGovernmentTick, createLoan, processTurnLoans, drawEvent, initGreyhounds, EVENTS_DECK, getRentTable, ownsFullGroup, getHouseCost, canSellEven, performStateAutoBuild, checkFiestaClandestina, getTransportDestinations, tickAdvancedEvents, calculateMaintenance, checkMarginCalls, createLoanPool, distributePoolDividends, trackTileLanding, handleRoleAbilities, processFioreTips, validateState, makeHistory, makeWatchdog, createFinancialOption, playBlackjack, playRoulette, getBotTradeProposal, evaluateTradeByBot } from './utils/gameLogic';
-import { COLORS, PLAYER_COLORS, FUNNY } from './constants';
+import { COLORS, FUNNY, PLAYER_EMOJIS } from './constants';
 
-const SAVE_KEY = 'artiako_landak_save_v2';
-
-const resolveAuction = (state: GameState): GameState => {
-    if (!state.auction) return state;
-    const winnerId = state.auction.highestBidder;
-    let newState = { ...state };
-    
-    if (winnerId !== null && typeof winnerId === 'number') {
-        const wIdx = state.players.findIndex(p => p.id === winnerId);
-        if (wIdx === -1) return { ...state, auction: null };
-        
-        const wPlayer = { ...state.players[wIdx] };
-        const wTiles = [...state.tiles];
-        
-        if (wPlayer.money >= state.auction.currentBid) {
-            wPlayer.money -= state.auction.currentBid;
-            newState.estadoMoney += state.auction.currentBid;
-            
-            const targets = state.auction.kind === 'bundle' && state.auction.items ? state.auction.items : [state.auction.tileId];
-            targets.forEach(tid => {
-                if (!wPlayer.props.includes(tid)) wPlayer.props.push(tid);
-                wTiles[tid].owner = wPlayer.id;
-            });
-            
-            const wPs = [...state.players];
-            wPs[wIdx] = wPlayer;
-            
-            newState.players = wPs;
-            newState.tiles = wTiles;
-            newState.logs = [`🔨 ¡Vendido! ${wPlayer.name} gana por ${formatMoney(state.auction.currentBid)}`, ...state.logs];
-        } else {
-             newState.logs = [`🔨 Subasta cancelada: ${wPlayer.name} no puede pagar.`, ...state.logs];
-        }
-    } else {
-        newState.logs = ['🔨 Subasta desierta.', ...state.logs];
-    }
-    
-    newState.auction = null;
-    return newState;
-};
-
-const gameReducer = (state: GameState, action: any): GameState => {
-  switch (action.type) {
-    case 'START_GAME':
-      const playersWithRoles = action.payload; 
-      return { 
-        ...state, 
-        players: playersWithRoles, 
-        gameStarted: true, 
-        currentPlayerIndex: 0,
-        estadoMoney: 0, 
-        logs: ['Partida comenzada!', 'Roles asignados.', '¡Buena suerte!'],
-        turnCount: 1
-      };
-      
-    case 'LOAD_GAME':
-      return { ...action.payload, logs: ['💾 Partida cargada correctamente.', ...action.payload.logs] };
-    
-    case 'RESTORE_STATE':
-        return action.payload;
-
-    case 'ROLL_DICE':
-      if (state.rolled) return state;
-      const pIdx = state.currentPlayerIndex;
-      const player = { ...state.players[pIdx] };
-      const [d1, d2] = action.payload?.dice || rollDice(); 
-      const total = d1 + d2;
-      const isDouble = d1 === d2;
-      
-      let logs = [`${player.name} sacó ${d1} + ${d2} = ${total}.${isDouble ? ' ¡DOBLES!' : ''}`];
-      let newPlayers = [...state.players];
-      let newRolled = !isDouble; 
-      let newPos = (player.pos + total) % state.tiles.length;
-      let newEstadoMoney = state.estadoMoney;
-      
-      if (player.jail > 0) {
-          if (isDouble) { 
-              player.jail = 0; 
-              logs.push('¡Dobles! Sales de la cárcel.'); 
-              newPos = (player.pos + total) % state.tiles.length; 
-          } else { 
-              player.jail--; 
-              logs.push(`Te quedan ${player.jail} turnos.`); 
-              newPos = player.pos; 
-              newRolled = true; 
-          }
-      } else {
-          if (newPos < player.pos) { 
-              const salary = 200;
-              player.money += salary; 
-              newEstadoMoney -= salary;
-              logs.push('Cobras 200 de salida (paga el Estado).'); 
-          }
-      }
-      
-      player.pos = newPos;
-      const newHeatmap = trackTileLanding(state, newPos);
-      const roleLogs = handleRoleAbilities(state, player, state.tiles[newPos]);
-      
-      const tile = state.tiles[newPos];
-      let showCasino = false;
-      let casinoGame: 'blackjack' | 'roulette' | null = null;
-      if (tile.subtype === 'casino_bj') { showCasino = true; casinoGame = 'blackjack'; }
-      if (tile.subtype === 'casino_roulette') { showCasino = true; casinoGame = 'roulette'; }
-      if (tile.type === TileType.SLOTS) { showCasino = true; casinoGame = null; }
-
-      if (player.isBot) {
-          showCasino = false; 
-      }
-
-      newPlayers[pIdx] = player;
-
-      let finalState: GameState = {
-        ...state,
-        rolled: newRolled,
-        dice: [d1, d2] as [number, number],
-        players: newPlayers,
-        estadoMoney: newEstadoMoney,
-        heatmap: newHeatmap,
-        showCasinoModal: showCasino,
-        casinoGame: casinoGame,
-        logs: [...logs, ...roleLogs, ...state.logs],
-        selectedTileId: state.selectedTileId, 
-        usedTransportHop: false
-      };
-
-      if (tile.type === TileType.EVENT) {
-          const evtRes = drawEvent(finalState, pIdx);
-          finalState = { ...finalState, ...evtRes };
-      }
-
-      return finalState;
-    
-    case 'END_TURN':
-      let epIdx = state.currentPlayerIndex;
-      let ePlayer = state.players[epIdx];
-      let endLogs: string[] = [];
-      let ePlayers = [...state.players];
-      
-      let currentEstadoMoney = state.estadoMoney;
-
-      const loanRes = processTurnLoans(state, epIdx);
-      endLogs.push(...(loanRes.logs || []));
-      ePlayers = loanRes.players as Player[];
-      
-      const fiorePay = state.tiles.filter(t => t.subtype === 'fiore' && t.owner === ePlayer.id).reduce((acc, t) => acc + (t.workers||0)*70, 0); 
-      if(fiorePay > 0) endLogs.push(...processFioreTips(state, ePlayers[epIdx], fiorePay));
-
-      const stateBuild = performStateAutoBuild(state.tiles, state.housesAvail, state.hotelsAvail, currentEstadoMoney, state.gov);
-      const eTiles = stateBuild.tiles;
-      currentEstadoMoney = stateBuild.estadoMoney;
-      
-      endLogs.push(...stateBuild.logs);
-
-      const advUpdates = tickAdvancedEvents(state);
-      const govUpdate = handleGovernmentTick({ ...state, players: ePlayers, estadoMoney: currentEstadoMoney });
-      
-      if (govUpdate.estadoMoney !== undefined) currentEstadoMoney = govUpdate.estadoMoney;
-      let finalPlayers = govUpdate.players || ePlayers;
-
-      let nextIdx = getNextPlayerIndex({ ...state, players: finalPlayers });
-      
-      const maintFee = calculateMaintenance(finalPlayers[nextIdx].id, eTiles);
-      if (maintFee > 0) { 
-          finalPlayers[nextIdx].money -= maintFee; 
-          currentEstadoMoney += maintFee; 
-          endLogs.push(`🏗️ Mantenimiento: ${finalPlayers[nextIdx].name} paga ${formatMoney(maintFee)}.`);
-      }
-      
-      const marginRes = checkMarginCalls({ ...state, players: finalPlayers, tiles: eTiles } as GameState, finalPlayers[nextIdx].id);
-      if (marginRes.soldTiles.length > 0) {
-          endLogs.push(`📉 MARGIN CALL: ${finalPlayers[nextIdx].name} vende: ${marginRes.soldTiles.join(', ')} (+${formatMoney(marginRes.amountRaised)}).`);
-      }
-      
-      const newState = {
-        ...state,
-        ...govUpdate, 
-        ...advUpdates,
-        tiles: eTiles,
-        loans: loanRes.loans as Loan[],
-        currentPlayerIndex: nextIdx,
-        rolled: false,
-        turnCount: state.turnCount + 1,
-        logs: [`Turno de ${finalPlayers[nextIdx].name}`, ...endLogs, ...(govUpdate.logs||[]), ...state.logs]
-      };
-
-      const validationErrs = validateState(newState, newState.tiles);
-      if(validationErrs.length > 0) {
-          console.error("State Corruption Detected:", validationErrs);
-          newState.logs = [...newState.logs, ...validationErrs.map(e => `⚠️ ERROR: ${e}`)];
-      }
-
-      return newState;
-
-    case 'BUY_PROP': { 
-        const buyerIdx = state.currentPlayerIndex; 
-        const buyer = { ...state.players[buyerIdx] }; 
-        const tileId = buyer.pos; 
-        const tile = { ...state.tiles[tileId] }; 
-        
-        if (state.gov === 'left') {
-             return { ...state, logs: ['🚫 Gobierno de Izquierdas prohíbe la compra privada.', ...state.logs] };
-        }
-
-        if (tile.price && buyer.money >= tile.price) { 
-            buyer.money -= tile.price; 
-            state.estadoMoney += tile.price; 
-            buyer.props.push(tileId); 
-            tile.owner = buyer.id; 
-            const uPlayers = [...state.players]; 
-            uPlayers[buyerIdx] = buyer; 
-            const uTiles = [...state.tiles]; 
-            uTiles[tileId] = tile; 
-            return { ...state, players: uPlayers, tiles: uTiles, logs: [`${buyer.name} compró ${tile.name} por ${formatMoney(tile.price)} (Pago al Estado)`, ...state.logs] }; 
-        } 
-        return state; 
-    }
-    case 'BUILD_HOUSE': {
-        const { tId } = action.payload;
-        const pIdx = state.currentPlayerIndex;
-        const player = { ...state.players[pIdx] };
-        const tile = { ...state.tiles[tId] };
-        const cost = getHouseCost(tile);
-
-        if (tile.owner === player.id && player.money >= cost && (tile.houses || 0) < 5) {
-             player.money -= cost;
-             state.estadoMoney += cost; 
-             if ((tile.houses || 0) === 4) { tile.houses = 0; tile.hotel = true; }
-             else { tile.houses = (tile.houses || 0) + 1; }
-             
-             const uTiles = [...state.tiles]; uTiles[tId] = tile;
-             const uPlayers = [...state.players]; uPlayers[pIdx] = player;
-             return { ...state, tiles: uTiles, players: uPlayers, logs: [`${player.name} mejoró ${tile.name}.`, ...state.logs] };
-        }
-        return state;
-    }
-    case 'PAY_RENT': { 
-        const payerIdx = state.currentPlayerIndex; 
-        const payer = { ...state.players[payerIdx] }; 
-        const tId = payer.pos; 
-        const t = state.tiles[tId]; 
-        const baseRent = getRent(t, state.dice[0] + state.dice[1], state.tiles, state); 
-        
-        if (baseRent > 0 && typeof t.owner === 'number' && t.owner !== payer.id) { 
-            const ivaRate = state.currentGovConfig.rentIVA || 0; 
-            const ivaAmount = Math.round(baseRent * ivaRate);
-            const totalPay = baseRent + ivaAmount;
-
-            payer.money -= totalPay; 
-            
-            const ownerIdx = state.players.findIndex(p => p.id === t.owner); 
-            const updatedPlayers = [...state.players]; 
-            updatedPlayers[payerIdx] = payer; 
-            
-            let logStr = `${payer.name} pagó ${formatMoney(baseRent)} a ${updatedPlayers[ownerIdx]?.name}`;
-
-            if (ownerIdx !== -1) { 
-                updatedPlayers[ownerIdx] = { ...updatedPlayers[ownerIdx], money: updatedPlayers[ownerIdx].money + baseRent }; 
-            } 
-            
-            let newEstadoMoney = state.estadoMoney;
-            if (ivaAmount > 0) {
-                newEstadoMoney += ivaAmount;
-                logStr += ` + ${formatMoney(ivaAmount)} IVA al Estado.`;
-            }
-
-            return { ...state, players: updatedPlayers, estadoMoney: newEstadoMoney, logs: [logStr, ...state.logs] }; 
-        } 
-        return state; 
-    }
-    case 'PAY_JAIL': { 
-        const jpIdx = state.currentPlayerIndex; 
-        const jPlayer = { ...state.players[jpIdx] }; 
-        if (jPlayer.money >= 50 && jPlayer.jail > 0) { 
-            jPlayer.money -= 50; 
-            jPlayer.jail = 0; 
-            const jpPlayers = [...state.players]; 
-            jpPlayers[jpIdx] = jPlayer; 
-            return { ...state, players: jpPlayers, estadoMoney: state.estadoMoney + 50, logs: [`${jPlayer.name} paga fianza de $50 y queda libre.`, ...state.logs] }; 
-        } 
-        return state; 
-    }
-
-    // --- AUCTION ---
-    case 'START_AUCTION': { 
-        const aucTileId = action.payload; 
-        return { 
-            ...state, 
-            auction: { 
-                tileId: aucTileId, 
-                currentBid: 0, 
-                highestBidder: null, 
-                activePlayers: state.players.filter(p => p.alive).map(p => p.id), 
-                timer: 20, 
-                isOpen: true, 
-                kind: 'tile' 
-            } 
-        }; 
-    }
-    case 'BID_AUCTION': { 
-        const { amount, pId: bidderId } = action.payload; 
-        if (state.auction && amount > state.auction.currentBid && state.auction.activePlayers.includes(bidderId)) { 
-            return { ...state, auction: { ...state.auction, currentBid: amount, highestBidder: bidderId, timer: 10 }, logs: [`Subasta: ${state.players[bidderId].name} puja ${formatMoney(amount)}`, ...state.logs] }; 
-        } 
-        return state; 
-    }
-    case 'TICK_AUCTION': {
-        if (!state.auction || !state.auction.isOpen) return state;
-        if (state.auction.timer <= 0) {
-             return resolveAuction(state);
-        }
-        return { ...state, auction: { ...state.auction, timer: state.auction.timer - 1 } };
-    }
-    case 'WITHDRAW_AUCTION': {
-        const { pId } = action.payload;
-        if (!state.auction) return state;
-        const newActive = state.auction.activePlayers.filter(id => id !== pId);
-        const quitter = state.players.find(p => p.id === pId);
-        
-        if (newActive.length === 0) {
-            // Everyone left, end auction immediately
-            return resolveAuction(state);
-        }
-        
-        return { 
-            ...state, 
-            auction: { ...state.auction, activePlayers: newActive }, 
-            logs: [`${quitter?.name} se retiró de la subasta.`, ...state.logs] 
-        };
-    }
-
-    case 'END_AUCTION': { 
-        return resolveAuction(state);
-    }
-    
-    // --- TRADE ---
-    case 'PROPOSE_TRADE': {
-        const proposal = action.payload; // If generic open modal, handle in UI. If bot payload, handle here.
-        if (proposal) return { ...state, trade: proposal, showTradeModal: true };
-        return { ...state, showTradeModal: true };
-    }
-    case 'ACCEPT_TRADE': {
-        if (!state.trade) return state;
-        const t = state.trade;
-        const p1 = state.players.find(p => p.id === t.initiatorId);
-        const p2 = state.players.find(p => p.id === t.targetId);
-        if (!p1 || !p2) return state;
-
-        // Execute Money
-        p1.money -= t.offeredMoney; p1.money += t.requestedMoney;
-        p2.money -= t.requestedMoney; p2.money += t.offeredMoney;
-
-        // Execute Props
-        const newTiles = [...state.tiles];
-        t.offeredProps.forEach(pid => {
-            const tile = newTiles[pid];
-            p1.props = p1.props.filter(id => id !== pid);
-            p2.props.push(pid);
-            tile.owner = p2.id;
-        });
-        t.requestedProps.forEach(pid => {
-            const tile = newTiles[pid];
-            p2.props = p2.props.filter(id => id !== pid);
-            p1.props.push(pid);
-            tile.owner = p1.id;
-        });
-
-        const ps = [...state.players];
-        // Ensure array update
-        return { ...state, players: ps, tiles: newTiles, trade: null, showTradeModal: false, logs: [`🤝 ¡Trato cerrado entre ${p1.name} y ${p2.name}!`, ...state.logs] };
-    }
-    case 'REJECT_TRADE': {
-        return { ...state, trade: null, showTradeModal: false, logs: [`❌ Trato rechazado.`, ...state.logs] };
-    }
-
-    // --- LOANS & POOLS ---
-    case 'TAKE_LOAN': { const { amount, interest, turns } = action.payload; const lBorrowerIdx = state.currentPlayerIndex; const lBorrower = { ...state.players[lBorrowerIdx] }; const newLoan = createLoan(lBorrower.id, amount, interest, turns); lBorrower.money += amount; const lPlayers = [...state.players]; lPlayers[lBorrowerIdx] = lBorrower; return { ...state, players: lPlayers, loans: [...state.loans, newLoan], estadoMoney: state.estadoMoney - amount, showBankModal: false, logs: [`${lBorrower.name} pidió un préstamo corrupto de ${formatMoney(amount)}`, ...state.logs] }; }
-    case 'CREATE_POOL': { const { loanIds, name } = action.payload; if(loanIds.length === 0) return state; const pool = createLoanPool(state, loanIds, name); return { ...state, logs: [`Pool "${name}" creado con ${loanIds.length} préstamos.`, ...state.logs] }; }
-    case 'DISTRIBUTE_DIVIDENDS': { const { poolId } = action.payload; const amt = distributePoolDividends(state, poolId); return { ...state, logs: [`Repartidos $${amt} en dividendos del Pool.`, ...state.logs] }; }
-    
-    // --- FINANCIAL OPTIONS ---
-    case 'CREATE_OPTION': {
-        const { type, propId, strike, premium, buyerId } = action.payload;
-        const sellerId = state.players[state.currentPlayerIndex].id;
-        const opt = createFinancialOption(state, type, propId, strike, premium, sellerId, buyerId);
-        const buyer = state.players.find(p => p.id === buyerId);
-        const seller = state.players.find(p => p.id === sellerId);
-        if(buyer && seller && buyer.money >= premium) {
-            buyer.money -= premium;
-            seller.money += premium;
-            return { ...state, financialOptions: [...state.financialOptions, opt], logs: [`Opción ${type.toUpperCase()} creada sobre #${propId} para ${buyer.name}.`, ...state.logs] };
-        }
-        return state;
-    }
-    case 'EXERCISE_OPTION': {
-        const { optId } = action.payload;
-        const opt = state.financialOptions.find(o => o.id === optId);
-        if(!opt) return state;
-        const buyer = state.players.find(p => p.id === opt.buyerId);
-        const seller = state.players.find(p => p.id === opt.sellerId);
-        const tile = state.tiles[opt.propertyId];
-        if(buyer && seller && tile && buyer.money >= opt.strikePrice) {
-             buyer.money -= opt.strikePrice;
-             seller.money += opt.strikePrice;
-             tile.owner = buyer.id;
-             const remainingOpts = state.financialOptions.filter(o => o.id !== optId);
-             return { ...state, financialOptions: remainingOpts, logs: [`Opción ejercida! ${buyer.name} adquiere ${tile.name}.`, ...state.logs] };
-        }
-        return state;
-    }
-
-    // --- CASINO ---
-    case 'PLAY_CASINO': {
-        const { game, bet } = action.payload; 
-        const player = state.players[state.currentPlayerIndex];
-        let amount = 0;
-        let logMsg = '';
-        
-        if (game === 'blackjack') {
-            const res = playBlackjack();
-            if (res.win) { amount = 15; player.money += 15; logMsg = `🃏 BJ: ${player.name} GANA (${res.player} vs ${res.dealer})`; }
-            else if (res.push) { logMsg = `🃏 BJ: Empate (${res.player})`; }
-            else { player.money -= 30; logMsg = `🃏 BJ: Pierdes (${res.player} vs ${res.dealer})`; }
-        } else if (game === 'roulette') {
-            const { betAmount, color } = bet;
-            if (player.money >= betAmount) {
-                const res = playRoulette(color);
-                if (res.win) { 
-                    const mult = color === 'green' ? 35 : 1; 
-                    player.money += betAmount * mult; 
-                    logMsg = `🎯 Ruleta: ${res.outcome} (${res.color}). GANAS ${formatMoney(betAmount*mult)}!`;
-                } else {
-                    player.money -= betAmount;
-                    logMsg = `🎯 Ruleta: ${res.outcome} (${res.color}). Pierdes.`;
-                }
-            }
-        }
-        
-        return { ...state, showCasinoModal: false, logs: [logMsg, ...state.logs] };
-    }
-    case 'CLOSE_CASINO': return { ...state, showCasinoModal: false };
-    case 'FBI_GUESS': { const { fbiId, targetId, roleGuess } = action.payload; const fbi = state.players.find(p => p.id === fbiId); const target = state.players.find(p => p.id === targetId); if(!fbi || !target) return state; const newGuesses = { ...state.fbiGuesses }; if(!newGuesses[fbiId]) newGuesses[fbiId] = {}; newGuesses[fbiId][targetId] = roleGuess; const isCorrect = target.role === roleGuess; const logMsg = isCorrect ? `🕵️ FBI ${fbi.name} acertó: ${target.name} es ${roleGuess}!` : `🕵️ FBI ${fbi.name} falló sospecha sobre ${target.name}.`; return { ...state, fbiGuesses: newGuesses, logs: [logMsg, ...state.logs] }; }
-    case 'TOGGLE_HEATMAP': return { ...state, showHeatmap: !state.showHeatmap };
-    case 'TOGGLE_LOANS_MODAL': return { ...state, showLoansModal: !state.showLoansModal };
-    case 'CLOSE_BANK_MODAL': return { ...state, showBankModal: false };
-    case 'TOGGLE_BANK_MODAL': return { ...state, showBankModal: !state.showBankModal };
-    case 'SELECT_TILE': return { ...state, selectedTileId: action.payload };
-    case 'CLOSE_MODAL': return { ...state, selectedTileId: null };
-    case 'CLOSE_EVENT': return { ...state, activeEvent: null };
-    case 'TOGGLE_BALANCE_MODAL': return { ...state, showBalanceModal: !state.showBalanceModal };
-    case 'PROPOSE_TRADE': return { ...state, showTradeModal: true };
-    case 'CLOSE_TRADE': return { ...state, showTradeModal: false };
-    case 'DEBUG_ADD_MONEY': { const { pId, amount } = action.payload; const ps = [...state.players]; if (ps[pId]) ps[pId].money += amount; return { ...state, players: ps }; }
-    case 'DEBUG_TELEPORT': { const { pId, pos } = action.payload; const ps = [...state.players]; if (ps[pId]) ps[pId].pos = pos; return { ...state, players: ps }; }
-    case 'DEBUG_SET_ROLE': { const { pId, role } = action.payload; const ps = [...state.players]; if (ps[pId]) ps[pId].role = role as any; return { ...state, players: ps }; }
-    case 'DEBUG_SET_GOV': return { ...state, gov: action.payload as any };
-    case 'DEBUG_TRIGGER_EVENT': return { ...state, nextEventId: action.payload };
-
-    default: return state;
-  }
-};
-
-const App: React.FC = () => {
+export default function App() {
   const [state, dispatch] = useReducer(gameReducer, createInitialState());
+  
+  // UI State
   const [setupOpen, setSetupOpen] = useState(true);
-  
-  // Animation State
-  const [isRolling, setIsRolling] = useState(false);
-  const [displayDice, setDisplayDice] = useState<[number, number]>([1, 1]);
-  
-  // Setup Configuration State
   const [setupHumans, setSetupHumans] = useState(2);
-  const [humanConfigs, setHumanConfigs] = useState<{name: string, gender: 'male'|'female'|'helicoptero'|'marcianito'}[]>([
-      { name: 'Jugador 1', gender: 'male' },
-      { name: 'Jugador 2', gender: 'female' }
+  const [humanConfigs, setHumanConfigs] = useState<{name:string, gender:string}[]>([
+      {name: 'Jugador 1', gender: 'male'},
+      {name: 'Jugador 2', gender: 'female'},
+      {name: 'Jugador 3', gender: 'male'},
+      {name: 'Jugador 4', gender: 'female'},
+      {name: 'Jugador 5', gender: 'male'},
+      {name: 'Jugador 6', gender: 'female'},
+      {name: 'Jugador 7', gender: 'male'},
+      {name: 'Jugador 8', gender: 'female'},
   ]);
-  const [numBots, setNumBots] = useState(0);
+  const [numBots, setNumBots] = useState(2);
+  const [isRolling, setIsRolling] = useState(false);
   
-  const historyRef = useRef(makeHistory<GameState>());
-  const watchdogRef = useRef(makeWatchdog(5000));
-
-  // Bot Timer Ref
-  const botTimeoutRef = useRef<any>(null);
-
+  // Trade UI State
+  const [tradeTargetId, setTradeTargetId] = useState<number|null>(null);
+  const [tradeOfferMoney, setTradeOfferMoney] = useState(0);
+  const [tradeReqMoney, setTradeReqMoney] = useState(0);
+  const [tradeOfferProps, setTradeOfferProps] = useState<number[]>([]);
+  const [tradeReqProps, setTradeReqProps] = useState<number[]>([]);
+  
+  // Bank/Loan/Pool UI State
   const [loanAmount, setLoanAmount] = useState(500);
   const [loanTurns, setLoanTurns] = useState(10);
-  const [poolName, setPoolName] = useState('Nuevo Pool');
+  const [poolName, setPoolName] = useState('');
   const [selectedLoansForPool, setSelectedLoansForPool] = useState<string[]>([]);
-  const [optPropId, setOptPropId] = useState<number>(0);
-  const [optStrike, setOptStrike] = useState(100);
-  const [optPremium, setOptPremium] = useState(20);
-  const [optBuyer, setOptBuyer] = useState<number>(0);
-  const [rouletteBet, setRouletteBet] = useState(50);
-  const [rouletteColor, setRouletteColor] = useState<'red'|'black'|'green'>('red');
+  
+  // Options UI State
+  const [optPropId, setOptPropId] = useState(0);
+  const [optStrike, setOptStrike] = useState(0);
+  const [optPremium, setOptPremium] = useState(0);
+  const [optBuyer, setOptBuyer] = useState(0);
 
-  // Auction Timer Effect
-  useEffect(() => {
-      let interval: any = null;
-      if (state.auction && state.auction.isOpen) {
-          interval = setInterval(() => {
-              dispatch({ type: 'TICK_AUCTION' });
-          }, 1000);
-      }
-      return () => { if (interval) clearInterval(interval); };
-  }, [state.auction?.isOpen]);
+  // Casino UI State
+  const [rouletteBet, setRouletteBet] = useState(0);
+  const [rouletteColor, setRouletteColor] = useState<'red'|'black'|'green'>('black');
 
-  // Sync humanConfigs when setupHumans changes
-  useEffect(() => {
-      setHumanConfigs(prev => {
-          const next = [...prev];
-          if (setupHumans > prev.length) {
-              for(let i = prev.length; i < setupHumans; i++) {
-                  next.push({ name: `Jugador ${i+1}`, gender: 'male' });
-              }
-          } else if (setupHumans < prev.length) {
-              return next.slice(0, setupHumans);
-          }
-          return next;
-      });
-  }, [setupHumans]);
+  // Computed Values
+  const currentPlayer = state.players[state.currentPlayerIndex] || ({} as any);
+  const currentTile = state.tiles[currentPlayer.pos || 0];
+  const isTransport = ['rail', 'bus', 'ferry', 'air'].includes(currentTile?.subtype || '');
+  const availableTransports = getTransportDestinations(state, currentPlayer.pos || 0);
+  const canBuyDirect = currentTile?.type === TileType.PROP && currentTile.owner === null;
+  const canAuction = currentTile?.type === TileType.PROP && currentTile.owner === null;
+  const isBlockedByGov = state.gov === 'left' && canBuyDirect; 
+  const mustPayRent = currentTile?.type === TileType.PROP && currentTile.owner !== null && currentTile.owner !== currentPlayer.id && !currentTile.mortgaged && currentTile.owner !== 'E';
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.target instanceof HTMLInputElement) return;
-    if (e.key.toLowerCase() === 's') { localStorage.setItem(SAVE_KEY, JSON.stringify(state)); alert('💾 Guardado'); }
-    if (e.key.toLowerCase() === 'l') { const saved = localStorage.getItem(SAVE_KEY); if (saved) dispatch({type:'LOAD_GAME', payload: JSON.parse(saved)}); }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        if (historyRef.current.canUndo()) {
-            const prev = historyRef.current.undo();
-            if (prev) dispatch({ type: 'RESTORE_STATE', payload: prev });
-        }
-    }
-  };
-  useEffect(() => { window.addEventListener('keydown', handleKeyDown); return () => window.removeEventListener('keydown', handleKeyDown); }, [state]);
-
-  useEffect(() => {
-      historyRef.current.snapshot(state);
-  }, [state.turnCount, state.currentPlayerIndex]);
-
-  // Dice Roll Logic with Animation
-  const handleRollDice = () => {
-      if (isRolling || state.rolled) return;
-      setIsRolling(true);
-      
-      const interval = setInterval(() => {
-          setDisplayDice([Math.ceil(Math.random()*6), Math.ceil(Math.random()*6)]);
-      }, 80);
-
-      setTimeout(() => {
-          clearInterval(interval);
-          const finalDice: [number, number] = [Math.ceil(Math.random()*6), Math.ceil(Math.random()*6)];
-          setDisplayDice(finalDice);
-          setIsRolling(false);
-          dispatch({ type: 'ROLL_DICE', payload: { dice: finalDice } });
-      }, 800);
-  };
-
-  // Sync display dice with state when state updates from other sources (bots)
-  useEffect(() => {
-      if(!isRolling) {
-          setDisplayDice(state.dice);
-      }
-  }, [state.dice, isRolling]);
-
-  // --- BOT AI LOGIC (Separate Effect for Auction) ---
-  useEffect(() => {
-      if (state.auction && state.auction.isOpen) {
-          const auction = state.auction;
-          // IMPORTANT: Check primitive values or stable refs to avoid timer reset loop
-          
-          const activeBots = state.players.filter(p => p.isBot && auction.activePlayers.includes(p.id));
-          
-          // Only think if there are bots that can bid
-          if (activeBots.length > 0) {
-              const delay = 1000 + Math.random() * 2000;
-              const timer = setTimeout(() => {
-                  if (!state.auction?.isOpen) return;
-                  
-                  // Re-evaluate with fresh state inside timeout
-                  const currentAuc = state.auction;
-                  const currentBots = state.players.filter(p => p.isBot && currentAuc.activePlayers.includes(p.id));
-                  
-                  const candidate = currentBots.find(bot => {
-                      if (currentAuc.highestBidder === bot.id) return false; 
-                      if (bot.money < currentAuc.currentBid + 10) return false; 
-                      
-                      const tile = state.tiles[currentAuc.tileId];
-                      let val = (tile.price || 0);
-                      const group = state.tiles.filter(t => t.color === tile.color);
-                      const myCount = group.filter(t => t.owner === bot.id).length;
-                      if (myCount > 0) val *= 1.5; 
-                      if (myCount === group.length - 1) val *= 2.5; 
-                      
-                      if (currentAuc.currentBid > val || bot.money < currentAuc.currentBid + 50) return false;
-                      return true;
-                  });
-
-                  if (candidate) {
-                      dispatch({ type: 'BID_AUCTION', payload: { amount: currentAuc.currentBid + 10, pId: candidate.id } });
-                  }
-              }, delay);
-              return () => clearTimeout(timer);
-          }
-      }
-  }, [state.auction?.currentBid, state.auction?.highestBidder, state.auction?.isOpen]); 
-  // Dependency array MUST NOT include 'state' or 'state.auction' object, only primitives that change when a bid happens.
-
-  // --- MAIN BOT LOGIC (Turn & Trade) ---
+  // BOT INTELLIGENCE ENGINE
   useEffect(() => {
       if (!state.gameStarted) return;
-      if (state.activeEvent) return; 
+      if (!currentPlayer.isBot) return;
 
-      // 1. INCOMING TRADE HANDLING
-      if (state.trade && state.trade.isOpen && state.players[state.trade.targetId].isBot) {
-          const bot = state.players[state.trade.targetId];
-          const timer = setTimeout(() => {
-              const accept = evaluateTradeByBot(state, bot, state.trade!);
-              if (accept) dispatch({ type: 'ACCEPT_TRADE' });
-              else dispatch({ type: 'REJECT_TRADE' });
-          }, 2000);
-          return () => clearTimeout(timer);
-      }
-
-      // 2. TURN AI (Robust Promise Chain)
-      const currentPlayer = state.players[state.currentPlayerIndex];
-      if (currentPlayer && currentPlayer.isBot && !state.auction && !state.trade) {
-          
-          const botTurn = async () => {
-              const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-              // A. Pre-Roll / Jail
-              if (!state.rolled) {
-                  await wait(1000);
-                  if (currentPlayer.jail > 0) {
-                      if (currentPlayer.money > 500) dispatch({ type: 'PAY_JAIL' });
-                      else dispatch({ type: 'ROLL_DICE' });
-                  } else {
-                      dispatch({ type: 'ROLL_DICE' });
-                  }
-                  return; // State update triggers re-effect
-              }
-
-              await wait(1500); // Wait for roll animation/move
-
-              // B. Action Phase
-              const tile = state.tiles[currentPlayer.pos];
-              
-              // B1. Buy / Auction
-              if (tile.type === TileType.PROP && tile.owner === null) {
-                  if (state.gov === 'left') {
-                      // Do nothing
-                  } else if (state.gov === 'authoritarian') {
-                      if (currentPlayer.money > (tile.price || 0) + 100) dispatch({ type: 'BUY_PROP' });
-                  } else {
-                      dispatch({ type: 'START_AUCTION', payload: tile.id });
-                      return; // Auction triggers re-effect
-                  }
-              }
-
-              // B2. Pay Rent (Handled)
-              if (tile.type === TileType.PROP && tile.owner !== null && tile.owner !== currentPlayer.id && tile.owner !== 'E') {
-                  dispatch({ type: 'PAY_RENT' });
-                  await wait(1000);
-              }
-
-              // B3. Trading (Intelligent)
-              const tradeProposal = getBotTradeProposal(state, currentPlayer);
-              if (tradeProposal) {
-                  dispatch({ type: 'PROPOSE_TRADE', payload: tradeProposal });
-                  return; // Wait for player response
-              }
-
-              // B4. Build / Mortgage (Asset Management)
-              // If broke, mortgage. If rich, build.
-              if (currentPlayer.money < 0) {
-                  // Logic to mortgage (simplified for now: AI generally doesn't go negative without losing, but good for robust play)
+      let timer: any;
+      // Step 1: ROLL DICE
+      if (!state.rolled) {
+          timer = setTimeout(() => {
+              if (currentPlayer.jail > 0 && currentPlayer.money > 200) {
+                  dispatch({type: 'PAY_JAIL'});
               } else {
-                  const colors = [...new Set(state.tiles.filter(t => t.color).map(t => t.color))];
-                  for (const c of colors) {
-                      const group = state.tiles.filter(t => t.color === c);
-                      if (group.every(t => t.owner === currentPlayer.id) && currentPlayer.money > 300) {
-                          const lowest = group.reduce((prev, curr) => (curr.houses||0) < (prev.houses||0) ? curr : prev);
-                          if ((lowest.houses || 0) < 5) {
-                              dispatch({ type: 'BUILD_HOUSE', payload: { tId: lowest.id } });
-                              await wait(500); // Visual delay for build
-                              break; // Build one at a time
-                          }
-                      }
-                  }
+                  dispatch({type: 'ROLL_DICE'});
               }
-
-              // B5. End Turn (Safety Valve)
-              await wait(500);
-              dispatch({ type: 'END_TURN' });
-          };
-
-          botTurn();
+          }, 1500);
+      } 
+      // Step 2: ACT & END TURN
+      else {
+          timer = setTimeout(() => {
+              dispatch({type: 'BOT_RESOLVE_TURN'});
+              setTimeout(() => {
+                  dispatch({type: 'END_TURN'});
+              }, 1000);
+          }, 1500);
       }
+      return () => clearTimeout(timer);
+  }, [state.gameStarted, state.currentPlayerIndex, state.rolled, currentPlayer.isBot, currentPlayer.jail, currentPlayer.money]);
 
-  }, [state.currentPlayerIndex, state.rolled, state.turnCount, state.gameStarted, state.trade]);
+  const handleRollDice = async () => {
+    setIsRolling(true);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    dispatch({ type: 'ROLL_DICE' });
+    setIsRolling(false);
+  };
 
   const startGame = () => {
-    const newPlayers: Player[] = [];
-    let idCounter = 0;
-    
-    // Create Humans from Config
-    humanConfigs.forEach((cfg, idx) => {
-        newPlayers.push({
-            id: idCounter++,
-            name: cfg.name,
-            money: INITIAL_MONEY,
-            pos: 0,
-            alive: true,
-            jail: 0,
-            color: PLAYER_COLORS[idx % PLAYER_COLORS.length],
-            isBot: false,
-            gender: cfg.gender as any,
-            props: [],
-            taxBase: 0,
-            vatIn: 0,
-            vatOut: 0,
-            doubleStreak: 0,
-            insiderTokens: 0
-        });
+    dispatch({
+        type: 'START_GAME',
+        payload: {
+            humans: humanConfigs.slice(0, setupHumans),
+            bots: numBots
+        }
     });
-
-    const botGenders: ('male'|'female'|'helicoptero'|'marcianito')[] = ['male', 'female', 'helicoptero', 'marcianito'];
-
-    for (let i = 0; i < numBots; i++) { 
-        newPlayers.push({ 
-            id: idCounter++, 
-            name: `Bot ${i + 1}`, 
-            money: INITIAL_MONEY, 
-            pos: 0, 
-            alive: true, 
-            jail: 0, 
-            color: PLAYER_COLORS[(humanConfigs.length + i) % PLAYER_COLORS.length], 
-            isBot: true, 
-            gender: botGenders[Math.floor(Math.random() * botGenders.length)], 
-            props: [], 
-            taxBase: 0, 
-            vatIn: 0, 
-            vatOut: 0, 
-            doubleStreak: 0, 
-            insiderTokens: 0 
-        }); 
-    }
-    
-    dispatch({ type: 'START_GAME', payload: assignRoles(newPlayers) });
     setSetupOpen(false);
   };
 
-  const currentPlayer = state.players[state.currentPlayerIndex];
-  const currentTile = currentPlayer ? state.tiles[currentPlayer.pos] : null;
-  const isOwnerlessProp = currentTile && currentTile.type === TileType.PROP && currentTile.owner === null;
-  const mustPayRent = currentTile && currentTile.type === TileType.PROP && currentTile.owner !== null && currentPlayer && currentTile.owner !== currentPlayer.id && currentTile.owner !== 'E';
-
-  const canBuyDirect = isOwnerlessProp && currentPlayer && currentPlayer.money >= (currentTile.price || 0) && state.gov === 'authoritarian';
-  const canAuction = isOwnerlessProp && ['right', 'libertarian', 'anarchy'].includes(state.gov);
-  const isBlockedByGov = isOwnerlessProp && state.gov === 'left';
-
   return (
     <div className="flex w-screen h-screen bg-slate-900 text-slate-100 overflow-hidden font-sans">
-      <div className="flex-1 relative overflow-hidden flex items-center justify-center bg-slate-800">
-        <div className="absolute inset-0 flex items-center justify-center p-2 md:p-8">
-            <Board state={state} onTileClick={(id) => dispatch({type: 'SELECT_TILE', payload: id})} focusId={currentPlayer?.pos} />
-        </div>
+      
+      {/* LEFT: BOARD */}
+      <div className="flex-1 relative overflow-hidden flex items-center justify-center bg-slate-800 min-w-0">
+        <Board state={state} onTileClick={(id) => dispatch({type: 'SELECT_TILE', payload: id})} focusId={currentPlayer.pos} />
         <DebugPanel state={state} dispatch={dispatch} />
       </div>
-
-      <div className="w-80 md:w-96 bg-slate-900 border-l border-slate-700 flex flex-col shadow-2xl z-20 h-full">
-        <div className="p-4 border-b border-slate-700 bg-slate-800 flex justify-between items-center">
-            <div>
-                <h1 className="text-xl font-black text-white tracking-wider">Artiako Landak</h1>
-                <div className="flex flex-col gap-1 text-xs font-mono text-gray-400 mt-1">
-                    <div className="flex gap-2"><span>Turno: {state.turnCount}</span><span className="uppercase text-yellow-500">Gov: {state.gov}</span></div>
-                    <div className="text-emerald-400 font-bold">Estado: ${state.estadoMoney}</div>
-                </div>
-            </div>
-            <div className="flex gap-2">
-                <button onClick={() => { if(historyRef.current.canUndo()) dispatch({type: 'RESTORE_STATE', payload: historyRef.current.undo()}) }} className="text-xs bg-slate-700 px-2 py-1 rounded hover:bg-slate-600 disabled:opacity-50">↩ Undo</button>
-                <button onClick={() => setSetupOpen(true)} className="text-xs bg-slate-700 px-2 py-1 rounded hover:bg-slate-600">Reset</button>
-            </div>
-        </div>
-
-        <div className="p-4 bg-slate-800/50 border-b border-slate-700 flex flex-col gap-3">
-            {currentPlayer ? (
+      
+      {/* RIGHT: SIDEBAR */}
+      <div className="w-80 md:w-96 bg-slate-900 border-l border-slate-700 flex flex-col shadow-2xl z-20 flex-shrink-0">
+        
+        {/* Sidebar Header / Controls */}
+        <div className="p-4 bg-slate-800 border-b border-slate-700 shadow-md z-10">
+            {state.gameStarted ? (
                 <>
-                    <div className="flex justify-between items-center">
-                         <div className="font-bold text-lg flex items-center gap-2">
-                            <span className="w-4 h-4 rounded-full border border-white" style={{backgroundColor: currentPlayer.color}}></span>
-                            <span className="truncate">{currentPlayer.name}</span>
-                            {currentPlayer.role && <span className="text-[9px] bg-slate-600 px-1.5 py-0.5 rounded text-gray-300 uppercase tracking-wide border border-slate-500">{currentPlayer.role}</span>}
-                         </div>
-                         <div className="font-mono text-green-400 text-xl font-bold">${currentPlayer.money}</div>
+                    <div className="flex justify-between items-center mb-2">
+                        <div className="text-xl font-black text-yellow-500 tracking-wider">TURN {state.turnCount}</div>
+                        <div className="flex flex-col items-end">
+                            <div className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold border mb-1 ${state.gov==='left'?'border-red-500 text-red-400':state.gov==='right'?'border-blue-500 text-blue-400':'border-gray-500 text-gray-400'}`}>Gob: {state.gov} ({state.govTurnsLeft})</div>
+                            <div className="text-[10px] text-gray-400 font-mono">Reservas: <span className={`${state.estadoMoney < 0 ? 'text-red-500' : 'text-green-400'}`}>{formatMoney(state.estadoMoney)}</span></div>
+                        </div>
                     </div>
-                    
-                    {currentPlayer.jail > 0 && <div className="bg-red-900/30 border border-red-500/50 p-2 rounded text-center text-xs text-red-300">⛓️ CÁRCEL: {currentPlayer.jail} turnos</div>}
-                    
-                    <div className="grid grid-cols-2 gap-2">
-                        <div className={`bg-slate-900 rounded p-2 text-center border border-slate-600 ${isRolling ? 'animate-pulse border-yellow-500' : ''}`}><span className="block text-[9px] text-gray-500">DADO 1</span><span className="text-xl font-bold">{displayDice[0]}</span></div>
-                        <div className={`bg-slate-900 rounded p-2 text-center border border-slate-600 ${isRolling ? 'animate-pulse border-yellow-500' : ''}`}><span className="block text-[9px] text-gray-500">DADO 2</span><span className="text-xl font-bold">{displayDice[1]}</span></div>
-                    </div>
-
                     <div className="grid grid-cols-2 gap-2 mt-2">
                         {!state.rolled && !isRolling ? (
-                             <>
-                                {currentPlayer.jail > 0 && currentPlayer.money >= 50 && (
-                                    <button onClick={() => dispatch({type: 'PAY_JAIL'})} className="col-span-2 bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-2 rounded border-b-4 border-yellow-800">Pagar Fianza ($50)</button>
-                                )}
-                                <button onClick={handleRollDice} disabled={isRolling} className="col-span-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 text-white font-bold py-3 px-4 rounded shadow-lg active:scale-95 border-b-4 border-green-800 transition-all disabled:opacity-50">
-                                    {isRolling ? 'TIRANDO...' : 'TIRAR DADOS'}
-                                </button>
-                             </>
+                             currentPlayer.isBot ? (
+                                 <div className="col-span-2 text-center text-yellow-400 font-mono py-3 animate-pulse border border-yellow-500/30 rounded bg-yellow-900/10">🎲 {currentPlayer.name} va a tirar...</div>
+                             ) : (
+                                 <>
+                                    {currentPlayer.jail > 0 && currentPlayer.money >= 50 && (
+                                        <button onClick={() => dispatch({type: 'PAY_JAIL'})} className="col-span-2 bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-2 rounded border-b-4 border-yellow-800">Pagar Fianza ($50)</button>
+                                    )}
+                                    <button onClick={handleRollDice} disabled={isRolling} className="col-span-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 text-white font-bold py-3 px-4 rounded shadow-lg active:scale-95 border-b-4 border-green-800 transition-all disabled:opacity-50">
+                                        {isRolling ? 'TIRANDO...' : 'TIRAR DADOS'}
+                                    </button>
+                                 </>
+                             )
                         ) : (
                              <>
                                 {isRolling ? (
                                     <div className="col-span-2 text-center text-yellow-400 font-bold py-3 animate-bounce">🎲 RODANDO...</div>
                                 ) : (
-                                    <>
-                                        {canBuyDirect && <button onClick={() => dispatch({type: 'BUY_PROP'})} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 rounded border-b-4 border-blue-800 text-xs">Comprar (${currentTile?.price})</button>}
-                                        {canAuction && <button onClick={() => dispatch({type: 'START_AUCTION', payload: currentTile?.id})} className="bg-purple-600 hover:bg-purple-500 text-white font-bold py-2 rounded border-b-4 border-purple-800 text-xs">Subastar</button>}
-                                        {isBlockedByGov && <div className="col-span-2 bg-red-900/50 border border-red-700 p-1 text-center text-xs text-red-300 font-bold rounded">🚫 Compra bloqueada por el Gobierno</div>}
-                                        
-                                        {mustPayRent && <button onClick={() => dispatch({type: 'PAY_RENT'})} className="col-span-2 bg-red-600 hover:bg-red-500 text-white font-bold py-2 rounded border-b-4 border-red-800">Pagar Renta</button>}
-                                        <button onClick={() => dispatch({type: 'END_TURN'})} className="col-span-2 bg-slate-600 hover:bg-slate-500 text-white font-bold py-2 rounded border-b-4 border-slate-800">Terminar Turno</button>
-                                    </>
+                                    currentPlayer.isBot ? (
+                                        <div className="col-span-2 text-center text-emerald-400 font-mono py-2 animate-pulse">
+                                            🤖 {currentPlayer.name} está pensando...
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {isTransport && !state.usedTransportHop && (
+                                                <button onClick={() => {
+                                                    const dest = availableTransports[Math.floor(Math.random() * availableTransports.length)];
+                                                    if (dest) dispatch({type: 'TRAVEL_TRANSPORT', payload: { destId: dest }});
+                                                }} className="col-span-2 bg-sky-600 hover:bg-sky-500 text-white font-bold py-2 rounded border-b-4 border-sky-800 text-xs flex items-center justify-center gap-1">🚇 Viajar en Transporte ($50)</button>
+                                            )}
+
+                                            {canBuyDirect && <button onClick={() => dispatch({type: 'BUY_PROP'})} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 rounded border-b-4 border-blue-800 text-xs">Comprar (${currentTile?.price})</button>}
+                                            {canAuction && <button onClick={() => dispatch({type: 'START_AUCTION', payload: currentTile?.id})} className="bg-purple-600 hover:bg-purple-500 text-white font-bold py-2 rounded border-b-4 border-purple-800 text-xs">Subastar</button>}
+                                            {isBlockedByGov && <div className="col-span-2 bg-red-900/50 border border-red-700 p-1 text-center text-xs text-red-300 font-bold rounded">🚫 Compra bloqueada por el Gobierno</div>}
+                                            
+                                            {mustPayRent && <button onClick={() => dispatch({type: 'PAY_RENT'})} className="col-span-2 bg-red-600 hover:bg-red-500 text-white font-bold py-2 rounded border-b-4 border-red-800">Pagar Renta</button>}
+                                            <button onClick={() => dispatch({type: 'END_TURN'})} className="col-span-2 bg-slate-600 hover:bg-slate-500 text-white font-bold py-2 rounded border-b-4 border-slate-800">Terminar Turno</button>
+                                        </>
+                                    )
                                 )}
                              </>
                         )}
-                        <button onClick={() => dispatch({type: 'PROPOSE_TRADE'})} className="bg-indigo-700 hover:bg-indigo-600 text-[10px] py-1 rounded text-gray-200">Comercio</button>
+                        <button onClick={() => { setTradeTargetId(null); setTradeOfferMoney(0); setTradeReqMoney(0); setTradeOfferProps([]); setTradeReqProps([]); dispatch({type: 'PROPOSE_TRADE'}); }} className="bg-indigo-700 hover:bg-indigo-600 text-[10px] py-1 rounded text-gray-200">Comercio</button>
                         <button onClick={() => dispatch({type: 'TOGGLE_BANK_MODAL'})} className="bg-red-800 hover:bg-red-700 text-[10px] py-1 rounded text-gray-200">Banca</button>
                         <button onClick={() => dispatch({type: 'TOGGLE_BALANCE_MODAL'})} className="bg-emerald-700 hover:bg-emerald-600 text-[10px] py-1 rounded text-white">Mi Balance</button>
                         <button onClick={() => dispatch({type: 'TOGGLE_HEATMAP'})} className={`text-[10px] py-1 rounded text-white ${state.showHeatmap ? 'bg-orange-600' : 'bg-slate-700'}`}>Heatmap</button>
@@ -862,38 +197,240 @@ const App: React.FC = () => {
 
         {/* Logs */}
         <div className="h-32 bg-black/80 p-2 font-mono text-[10px] overflow-y-auto border-t border-slate-700 text-gray-400 custom-scrollbar">
-            {state.logs.map((l, i) => <div key={i} className="mb-1 border-b border-gray-900 pb-1 last:border-0 hover:bg-white/5">{l}</div>)}
+            {state.logs.slice().reverse().map((l, i) => <div key={i} className="mb-1 border-b border-gray-900 pb-1 last:border-0 hover:bg-white/5">{l}</div>)}
         </div>
       </div>
 
-      {state.showTradeModal && state.trade && (
+      {state.showBalanceModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={() => dispatch({type: 'TOGGLE_BALANCE_MODAL'})}>
+              <div className="bg-slate-800 p-6 rounded-xl border border-emerald-500 shadow-2xl max-w-lg w-full max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+                  <h2 className="text-2xl font-black text-emerald-400 mb-4 flex items-center gap-2 border-b border-slate-700 pb-2">
+                      💼 PORTFOLIO DE {state.players[state.currentPlayerIndex].name}
+                  </h2>
+                  <div className="flex-1 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                      {state.tiles.filter(t => t.owner === state.players[state.currentPlayerIndex].id).length === 0 && (
+                          <div className="text-center text-gray-500 italic py-8">No tienes propiedades. ¡A comprar!</div>
+                      )}
+                      {state.tiles.filter(t => t.owner === state.players[state.currentPlayerIndex].id).map(t => {
+                          const isMortgaged = t.mortgaged;
+                          const unmortgageCost = Math.round((t.price || 0) * 0.55);
+                          return (
+                              <div key={t.id} className={`p-3 rounded border flex justify-between items-center ${isMortgaged ? 'bg-slate-900/50 border-red-900/50 opacity-70' : 'bg-slate-700/50 border-slate-600'}`}>
+                                  <div className="flex items-center gap-3">
+                                      <div className={`w-4 h-4 rounded-full border border-white/20`} style={{backgroundColor: t.color ? COLORS[t.color as keyof typeof COLORS] : '#666'}}></div>
+                                      <div>
+                                          <div className="font-bold text-sm text-white flex items-center gap-2">
+                                              {t.name}
+                                              {isMortgaged && <span className="text-[9px] bg-red-600 text-white px-1 rounded uppercase">Hipotecada</span>}
+                                          </div>
+                                          <div className="text-[10px] text-gray-400">
+                                              {t.subtype === 'fiore' 
+                                                ? `${t.workers||0} Trabajadores` 
+                                                : t.hotel 
+                                                    ? '1 Hotel' 
+                                                    : `${t.houses||0} Casas`
+                                              }
+                                          </div>
+                                      </div>
+                                  </div>
+                                  <div className="flex flex-col items-end gap-1">
+                                      {isMortgaged ? (
+                                          <button 
+                                            onClick={() => dispatch({type: 'UNMORTGAGE_PROP', payload: { tId: t.id }})}
+                                            disabled={state.players[state.currentPlayerIndex].money < unmortgageCost}
+                                            className="bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-[10px] font-bold py-1 px-2 rounded"
+                                          >
+                                              Deshipotecar (${unmortgageCost})
+                                          </button>
+                                      ) : (
+                                          <button 
+                                            onClick={() => dispatch({type: 'MORTGAGE_PROP', payload: { tId: t.id }})}
+                                            className="bg-red-900/50 hover:bg-red-800 text-red-200 text-[10px] font-bold py-1 px-2 rounded border border-red-800"
+                                          >
+                                              Hipotecar (+${Math.round((t.price||0)*0.5)})
+                                          </button>
+                                      )}
+                                  </div>
+                              </div>
+                          );
+                      })}
+                  </div>
+                  <button onClick={() => dispatch({type: 'TOGGLE_BALANCE_MODAL'})} className="mt-4 w-full bg-slate-700 hover:bg-slate-600 text-white font-bold py-3 rounded">Cerrar</button>
+              </div>
+          </div>
+      )}
+
+      {/* GREYHOUNDS MODAL */}
+      {state.showGreyhounds && (
+          <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/90 backdrop-blur-md p-4">
+              <div className="bg-slate-800 w-full max-w-2xl p-6 rounded-xl border border-slate-600 shadow-2xl relative">
+                  <h2 className="text-3xl font-black text-center text-white mb-6 uppercase tracking-widest">🏁 Carrera de Galgos 🏁</h2>
+                  
+                  <div className="space-y-4 mb-8 bg-black/30 p-4 rounded-lg">
+                      {state.greyhounds.map(dog => (
+                          <div key={dog.id} className="relative h-12 bg-slate-700 rounded-full overflow-hidden border border-slate-600">
+                              <div className="absolute top-0 left-0 h-full transition-all duration-500 ease-linear" style={{ width: `${dog.progress}%`, backgroundColor: dog.color }}></div>
+                              <div className="absolute top-0 left-0 h-full w-full flex items-center px-4 justify-end z-10">
+                                  <span className="text-2xl drop-shadow-md">🐕</span>
+                              </div>
+                              <span className="absolute left-4 top-1/2 -translate-y-1/2 font-bold text-white text-shadow-sm z-20">#{dog.id}</span>
+                          </div>
+                      ))}
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2 mb-4">
+                      {state.players.filter(p => !p.isBot).map(p => {
+                          const hasBet = state.greyhoundBets[p.id];
+                          return (
+                              <div key={p.id} className="bg-slate-700 p-2 rounded text-center border border-slate-600">
+                                  <div className="font-bold text-xs text-white mb-1">{p.name}</div>
+                                  {!hasBet ? (
+                                      <div className="grid grid-cols-2 gap-1">
+                                          {[1,2,3,4].map(id => (
+                                              <button key={id} onClick={() => dispatch({type: 'BET_GREYHOUND', payload: { pId: p.id, dogId: id, amount: 50 }})} className="bg-blue-600 hover:bg-blue-500 text-white text-[10px] py-1 rounded font-bold">#{id}</button>
+                                          ))}
+                                      </div>
+                                  ) : (
+                                      <div className="text-yellow-400 font-bold text-xs">Apostó al #{hasBet} ($50)</div>
+                                  )}
+                              </div>
+                          );
+                      })}
+                  </div>
+                  
+                  <div className="text-center text-xs text-gray-400">Bote total: <span className="text-green-400 font-bold text-lg">${state.greyhoundPot}</span></div>
+              </div>
+          </div>
+      )}
+
+      {state.showTradeModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-              <div className="bg-slate-800 p-6 rounded-xl border border-indigo-500 shadow-2xl max-w-lg w-full">
-                  <h2 className="text-2xl font-black text-indigo-400 mb-4 flex items-center gap-2">🤝 PROPUESA DE CAMBIO</h2>
-                  <div className="grid grid-cols-2 gap-4 mb-6">
-                      <div className="bg-slate-900 p-3 rounded border border-slate-700">
-                          <div className="text-xs text-gray-500 uppercase font-bold mb-2">{state.players.find(p => p.id === state.trade!.initiatorId)?.name} OFRECE:</div>
-                          <div className="text-green-400 font-bold mb-1">${state.trade.offeredMoney}</div>
-                          <div className="space-y-1">
-                              {state.trade.offeredProps.map(pid => (
-                                  <div key={pid} className="text-xs text-white bg-slate-800 px-1 rounded border border-slate-600">{state.tiles[pid].name}</div>
-                              ))}
-                          </div>
-                      </div>
-                      <div className="bg-slate-900 p-3 rounded border border-slate-700">
-                          <div className="text-xs text-gray-500 uppercase font-bold mb-2">{state.players.find(p => p.id === state.trade!.targetId)?.name} RECIBE:</div>
-                          <div className="text-green-400 font-bold mb-1">${state.trade.requestedMoney}</div>
-                          <div className="space-y-1">
-                              {state.trade.requestedProps.map(pid => (
-                                  <div key={pid} className="text-xs text-white bg-slate-800 px-1 rounded border border-slate-600">{state.tiles[pid].name}</div>
-                              ))}
-                          </div>
-                      </div>
-                  </div>
-                  <div className="flex gap-3">
-                      <button onClick={() => dispatch({type: 'REJECT_TRADE'})} className="flex-1 bg-red-600 hover:bg-red-500 text-white font-bold py-3 rounded">RECHAZAR</button>
-                      <button onClick={() => dispatch({type: 'ACCEPT_TRADE'})} className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded">ACEPTAR</button>
-                  </div>
+              <div className="bg-slate-800 p-6 rounded-xl border border-indigo-500 shadow-2xl max-w-lg w-full h-[80vh] flex flex-col">
+                  {state.trade ? (
+                      // INCOMING OFFER VIEW
+                      <>
+                        <h2 className="text-2xl font-black text-indigo-400 mb-4 flex items-center gap-2">🤝 PROPUESA DE CAMBIO</h2>
+                        <div className="grid grid-cols-2 gap-4 mb-6 flex-1 overflow-y-auto">
+                            <div className="bg-slate-900 p-3 rounded border border-slate-700">
+                                <div className="text-xs text-gray-500 uppercase font-bold mb-2">{state.players.find(p => p.id === state.trade!.initiatorId)?.name} OFRECE:</div>
+                                <div className="text-green-400 font-bold mb-1">${state.trade.offeredMoney}</div>
+                                <div className="space-y-1">
+                                    {state.trade.offeredProps.map(pid => (
+                                        <div key={pid} className="text-xs text-white bg-slate-800 px-1 rounded border border-slate-600">{state.tiles[pid].name}</div>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="bg-slate-900 p-3 rounded border border-slate-700">
+                                <div className="text-xs text-gray-500 uppercase font-bold mb-2">{state.players.find(p => p.id === state.trade!.targetId)?.name} RECIBE:</div>
+                                <div className="text-green-400 font-bold mb-1">${state.trade.requestedMoney}</div>
+                                <div className="space-y-1">
+                                    {state.trade.requestedProps.map(pid => (
+                                        <div key={pid} className="text-xs text-white bg-slate-800 px-1 rounded border border-slate-600">{state.tiles[pid].name}</div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex gap-3">
+                            <button onClick={() => dispatch({type: 'REJECT_TRADE'})} className="flex-1 bg-red-600 hover:bg-red-500 text-white font-bold py-3 rounded">RECHAZAR</button>
+                            <button onClick={() => dispatch({type: 'ACCEPT_TRADE'})} className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded">ACEPTAR</button>
+                        </div>
+                      </>
+                  ) : (
+                      // CREATE OFFER VIEW
+                      <>
+                        <h2 className="text-2xl font-black text-white mb-4 flex items-center gap-2 pb-2 border-b border-indigo-500">📝 CREAR TRATO</h2>
+                        
+                        {tradeTargetId === null ? (
+                            <div className="flex-1 flex flex-col gap-2">
+                                <h3 className="text-gray-400 text-sm mb-2">Selecciona un socio comercial:</h3>
+                                {state.players.filter(p => p.id !== state.currentPlayerIndex && p.alive).map(p => (
+                                    <button 
+                                        key={p.id}
+                                        onClick={() => setTradeTargetId(p.id)}
+                                        className="w-full bg-slate-700 hover:bg-slate-600 p-3 rounded text-left flex justify-between items-center"
+                                    >
+                                        <span className="font-bold text-white">{p.name}</span>
+                                        <span className="text-xs text-green-400 font-mono">${p.money}</span>
+                                    </button>
+                                ))}
+                                <button onClick={() => dispatch({type: 'CLOSE_TRADE'})} className="mt-auto w-full bg-slate-800 hover:bg-slate-700 text-gray-400 py-2 rounded">Cancelar</button>
+                            </div>
+                        ) : (
+                            <div className="flex-1 flex flex-col min-h-0">
+                                <div className="grid grid-cols-2 gap-4 flex-1 min-h-0">
+                                    {/* Left: ME */}
+                                    <div className="bg-slate-900/50 p-2 rounded flex flex-col min-h-0">
+                                        <div className="text-xs text-green-400 font-bold mb-2 uppercase text-center border-b border-white/10 pb-1">TÚ OFRECES</div>
+                                        <div className="mb-2">
+                                            <label className="text-[10px] text-gray-500 block">Dinero</label>
+                                            <input type="number" value={tradeOfferMoney} onChange={e => setTradeOfferMoney(Math.min(state.players[state.currentPlayerIndex].money, Math.max(0, parseInt(e.target.value)||0)))} className="w-full bg-slate-800 border border-slate-600 text-white text-xs p-1 rounded" />
+                                        </div>
+                                        <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1">
+                                            {state.tiles.filter(t => t.owner === state.currentPlayerIndex).map(t => (
+                                                <label key={t.id} className="flex items-center gap-2 p-1 hover:bg-white/5 cursor-pointer text-xs">
+                                                    <input 
+                                                        type="checkbox" 
+                                                        checked={tradeOfferProps.includes(t.id)}
+                                                        onChange={e => {
+                                                            if(e.target.checked) setTradeOfferProps([...tradeOfferProps, t.id]);
+                                                            else setTradeOfferProps(tradeOfferProps.filter(id => id !== t.id));
+                                                        }}
+                                                    />
+                                                    <span style={{color: t.color ? COLORS[t.color as keyof typeof COLORS] : '#aaa'}}>{t.name}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* Right: THEM */}
+                                    <div className="bg-slate-900/50 p-2 rounded flex flex-col min-h-0">
+                                        <div className="text-xs text-red-400 font-bold mb-2 uppercase text-center border-b border-white/10 pb-1">{state.players[tradeTargetId].name} DA</div>
+                                        <div className="mb-2">
+                                            <label className="text-[10px] text-gray-500 block">Dinero</label>
+                                            <input type="number" value={tradeReqMoney} onChange={e => setTradeReqMoney(Math.min(state.players[tradeTargetId].money, Math.max(0, parseInt(e.target.value)||0)))} className="w-full bg-slate-800 border border-slate-600 text-white text-xs p-1 rounded" />
+                                        </div>
+                                        <div className="flex-1 overflow-y-auto custom-scrollbar space-y-1">
+                                            {state.tiles.filter(t => t.owner === tradeTargetId).map(t => (
+                                                <label key={t.id} className="flex items-center gap-2 p-1 hover:bg-white/5 cursor-pointer text-xs">
+                                                    <input 
+                                                        type="checkbox" 
+                                                        checked={tradeReqProps.includes(t.id)}
+                                                        onChange={e => {
+                                                            if(e.target.checked) setTradeReqProps([...tradeReqProps, t.id]);
+                                                            else setTradeReqProps(tradeReqProps.filter(id => id !== t.id));
+                                                        }}
+                                                    />
+                                                    <span style={{color: t.color ? COLORS[t.color as keyof typeof COLORS] : '#aaa'}}>{t.name}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="mt-4 flex gap-2">
+                                    <button onClick={() => setTradeTargetId(null)} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white">Atrás</button>
+                                    <button 
+                                        onClick={() => {
+                                            const offer: TradeOffer = {
+                                                initiatorId: state.currentPlayerIndex,
+                                                targetId: tradeTargetId,
+                                                offeredMoney: tradeOfferMoney,
+                                                offeredProps: tradeOfferProps,
+                                                requestedMoney: tradeReqMoney,
+                                                requestedProps: tradeReqProps,
+                                                isOpen: true
+                                            };
+                                            dispatch({type: 'PROPOSE_TRADE', payload: offer});
+                                            setTradeTargetId(null); // Reset UI
+                                        }} 
+                                        className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-2 rounded text-sm"
+                                    >
+                                        ENVIAR PROPUESTA
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                      </>
+                  )}
               </div>
           </div>
       )}
@@ -905,12 +442,18 @@ const App: React.FC = () => {
                   <div className="flex-1 overflow-y-auto space-y-4 pr-2">
                       <div className="bg-slate-900 p-4 rounded border border-slate-700">
                           <h3 className="font-bold mb-2 text-white">Pedir Préstamo Personal</h3>
-                          <div className="grid grid-cols-2 gap-2 text-xs">
-                              <label className="text-gray-400">Cantidad: ${loanAmount}</label>
-                              <input type="range" min="100" max="2000" step="100" value={loanAmount} onChange={e => setLoanAmount(Number(e.target.value))} className="accent-red-500"/>
-                              <div className="col-span-2 flex justify-between"><span>Plazo: {loanTurns} turnos</span><span>Interés: 20%</span></div>
-                              <button onClick={() => dispatch({type: 'TAKE_LOAN', payload: { amount: loanAmount, interest: 20, turns: loanTurns }})} className="col-span-2 bg-red-600 hover:bg-red-500 py-2 rounded text-white font-bold">Solicitar Fondos</button>
-                          </div>
+                          {state.creditCrunchTurns && state.creditCrunchTurns > 0 ? (
+                              <div className="bg-red-900/50 border border-red-500 p-2 rounded text-center text-red-300 font-bold text-xs mb-2">
+                                  🚨 CRISIS DE CRÉDITO: Préstamos bloqueados por {state.creditCrunchTurns} turnos.
+                              </div>
+                          ) : (
+                            <div className="grid grid-cols-2 gap-2 text-xs">
+                                <label className="text-gray-400">Cantidad: ${loanAmount}</label>
+                                <input type="range" min="100" max="2000" step="100" value={loanAmount} onChange={e => setLoanAmount(Number(e.target.value))} className="accent-red-500"/>
+                                <div className="col-span-2 flex justify-between"><span>Plazo: {loanTurns} turnos</span><span>Interés: 20%</span></div>
+                                <button onClick={() => dispatch({type: 'TAKE_LOAN', payload: { amount: loanAmount, interest: 20, turns: loanTurns }})} className="col-span-2 bg-red-600 hover:bg-red-500 py-2 rounded text-white font-bold">Solicitar Fondos</button>
+                            </div>
+                          )}
                       </div>
                       <div className="bg-slate-900 p-4 rounded border border-blue-700">
                           <h3 className="font-bold mb-2 text-blue-400">Crear Pool de Deuda</h3>
@@ -965,7 +508,7 @@ const App: React.FC = () => {
                       <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-white drop-shadow-md z-10">{state.auction.timer}s</div>
                   </div>
 
-                  <div className="text-center text-xs text-gray-400 mb-4">Puja más alta: {state.auction.highestBidder !== null ? state.players.find(p => p.id === state.auction.highestBidder)?.name : 'Nadie'}</div>
+                  <div className="text-center text-xs text-gray-400 mb-4">Puja más alta: {state.auction.highestBidder === 'E' ? 'ESTADO' : (state.auction.highestBidder !== null ? state.players.find(p => p.id === state.auction.highestBidder)?.name : 'Nadie')}</div>
 
                   <div className="space-y-3 mb-4">
                       {state.players.filter(p => !p.isBot && state.auction!.activePlayers.includes(p.id)).length === 0 && (
@@ -1030,7 +573,7 @@ const App: React.FC = () => {
           <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => dispatch({type: 'CLOSE_MODAL'})}>
               <div className="bg-slate-900 text-white w-full max-w-sm rounded-xl overflow-hidden shadow-2xl border border-slate-700 animate-in zoom-in-95" onClick={e => e.stopPropagation()}>
                   {(() => {
-                      const t = state.tiles[state.selectedTileId];
+                      const t = state.tiles[state.selectedTileId || 0];
                       const headerColor = t.color ? COLORS[t.color as keyof typeof COLORS] : '#334155';
                       const isOwner = t.owner === state.players[state.currentPlayerIndex]?.id;
                       const houseCost = getHouseCost(t);
@@ -1051,7 +594,11 @@ const App: React.FC = () => {
                                             {t.owner === null && canAuction && <button onClick={() => {dispatch({type: 'START_AUCTION', payload: t.id}); dispatch({type: 'CLOSE_MODAL'})}} className="col-span-2 bg-purple-600 hover:bg-purple-500 py-2 rounded font-bold text-white shadow-lg">Subastar</button>}
                                             {t.owner === null && isBlockedByGov && <div className="col-span-2 bg-red-900/50 p-2 text-center text-xs text-red-300 rounded font-bold border border-red-800">🚫 Gobierno de Izquierdas: Compra Prohibida</div>}
                                             
-                                            {isOwner && !t.mortgaged && (t.houses || 0) < 5 && ( <button onClick={() => dispatch({type: 'BUILD_HOUSE', payload: {tId: t.id}})} className="col-span-2 bg-blue-600 hover:bg-blue-500 py-2 rounded font-bold text-white shadow-lg">Construir ({formatMoney(houseCost)})</button> )}
+                                            {isOwner && !t.mortgaged && (t.houses || 0) < 5 && ( 
+                                                <button onClick={() => dispatch({type: 'BUILD_HOUSE', payload: {tId: t.id}})} className="col-span-2 bg-blue-600 hover:bg-blue-500 py-2 rounded font-bold text-white shadow-lg">
+                                                    {t.subtype === 'fiore' ? `Contratar Trabajador ($200)` : `Construir (${formatMoney(houseCost)})`}
+                                                </button> 
+                                            )}
                                         </div>
                                     </>
                                 ) : ( <div className="py-4 text-center"><div className="text-gray-500 italic mb-4">Casilla Especial<br/><span className="text-white font-bold not-italic mt-2 block">{t.type.toUpperCase()}</span></div><div className="bg-slate-800 p-4 rounded text-yellow-500 font-medium border border-slate-700 shadow-inner">"{FUNNY[t.type] || FUNNY.default}"</div></div> )}
@@ -1075,11 +622,11 @@ const App: React.FC = () => {
                               <label className="text-sm font-bold text-gray-300">Nº Humanos</label>
                               <span className="text-sm font-mono text-green-400">{setupHumans}</span>
                           </div>
-                          <input type="range" min="1" max="8" step="1" value={setupHumans} onChange={e => setSetupHumans(parseInt(e.target.value))} className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-green-500" />
+                          <input type="range" min="0" max="8" step="1" value={setupHumans} onChange={e => setSetupHumans(parseInt(e.target.value))} className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-green-500" />
                       </div>
 
                       <div className="space-y-3">
-                          {humanConfigs.map((cfg, idx) => (
+                          {humanConfigs.slice(0, setupHumans).map((cfg, idx) => (
                               <div key={idx} className="bg-slate-900 p-3 rounded border border-slate-700">
                                   <div className="text-xs text-gray-500 mb-1 uppercase font-bold">Jugador {idx + 1}</div>
                                   <input 
@@ -1087,7 +634,7 @@ const App: React.FC = () => {
                                       value={cfg.name} 
                                       onChange={(e) => {
                                           const newCfgs = [...humanConfigs];
-                                          newCfgs[idx].name = e.target.value;
+                                          newCfgs[idx] = { ...newCfgs[idx], name: e.target.value };
                                           setHumanConfigs(newCfgs);
                                       }}
                                       className="w-full bg-slate-800 border border-slate-600 rounded p-1 text-sm text-white mb-2"
@@ -1097,7 +644,7 @@ const App: React.FC = () => {
                                       value={cfg.gender}
                                       onChange={(e) => {
                                           const newCfgs = [...humanConfigs];
-                                          newCfgs[idx].gender = e.target.value as any;
+                                          newCfgs[idx] = { ...newCfgs[idx], gender: e.target.value };
                                           setHumanConfigs(newCfgs);
                                       }}
                                       className="w-full bg-slate-800 border border-slate-600 rounded p-1 text-xs text-white"
@@ -1123,10 +670,6 @@ const App: React.FC = () => {
               </div>
           </div> 
       )}
-      
-      {state.activeEvent && (<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in zoom-in-95"><div className="bg-slate-100 text-slate-900 p-8 rounded-xl shadow-2xl max-w-sm w-full text-center border-4 border-slate-300 relative overflow-hidden"><div className="absolute top-0 left-0 w-full h-4 bg-purple-600"></div><h3 className="text-2xl font-black mb-2 uppercase tracking-wide text-purple-700">{state.activeEvent.title}</h3><p className="text-gray-700 text-lg mb-6 leading-relaxed font-medium">{state.activeEvent.description}</p><button onClick={() => dispatch({type: 'CLOSE_EVENT'})} className="bg-slate-900 text-white px-6 py-3 rounded-lg font-bold hover:bg-slate-800 transition w-full">Entendido</button></div></div>)}
     </div>
   );
-};
-
-export default App;
+}
